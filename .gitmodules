@@ -1,0 +1,3 @@
+[submodule "Core/Src/protocol"]
+	path = Core/Src/protocol
+	url = https://github.com/Dzmitry-kulik/UART_driver.git
