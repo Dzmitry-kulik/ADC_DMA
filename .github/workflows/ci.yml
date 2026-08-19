@@ -50,5 +50,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stm32-firmware
-          path: build_out/UART_DRIVER.elf
+          path: build_out/PMW_CONFIG.elf
           retention-days: 7

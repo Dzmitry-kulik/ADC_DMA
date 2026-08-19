@@ -27,7 +27,7 @@ RUN renode --disable-xwt tests/test_board.resc & PID=$! && \
     python3 tests/benchmark.py --url socket://localhost:4321 --output build/benchmark_results.png && \
     python3 tests/stress_test.py --url socket://localhost:4321 --duration 10; \
     TEST_RESULT=$? ; \
-    gdb-multiarch build/UART_DRIVER.elf -batch -x tests/ci_debug.gdb ; \
+    gdb-multiarch build/PMW_CONFIG.elf -batch -x tests/ci_debug.gdb ; \
     kill $PID ; \
     exit $TEST_RESULT
 
@@ -44,6 +44,6 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # =========================================================================
 FROM scratch AS artifacts
 # Копируем прошивку из задачи prod_build
-COPY --from=prod_build /app/build_prod/UART_DRIVER.elf /
+COPY --from=prod_build /app/build_prod/PMW_CONFIG.elf /
 # Копируем график из задачи renode_tests
 COPY --from=renode_tests /app/build/benchmark_results.png /
