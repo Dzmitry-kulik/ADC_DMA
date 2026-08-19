@@ -1,0 +1,15 @@
+.metadata/
+.settings/
+**/ .settings/
+debugging/
+.project
+.cproject
+.mxproject
+build/
+build_prod/
+build_host/
+Debug/
+Release/
+*.log
+*.tmp
+.DS_Store

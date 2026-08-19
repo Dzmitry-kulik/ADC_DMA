@@ -1,0 +1,8 @@
+.git
+.vscode
+build/
+build_prod/
+build_host/
+*.elf
+*.bin
+*.png

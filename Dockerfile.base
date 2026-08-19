@@ -1,0 +1,21 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build gcc-12 g++-12 \
+    wget xz-utils ca-certificates gdb-multiarch \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
+    --slave /usr/bin/gcov gcov /usr/bin/gcov-12
+
+ENV CC=gcc-12 CXX=g++-12
+
+RUN wget -O /tmp/arm-toolchain.tar.xz https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi.tar.xz && \
+    mkdir -p /opt/arm-toolchain && \
+    tar -xf /tmp/arm-toolchain.tar.xz -C /opt/arm-toolchain --strip-components=1 && \
+    rm /tmp/arm-toolchain.tar.xz
+
+ENV PATH="/opt/arm-toolchain/bin:$PATH"

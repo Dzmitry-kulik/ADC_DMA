@@ -1,0 +1,54 @@
+name: PWM_testing
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+# Разрешения для использования GHCR
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Скачивание кода и сабмодулей
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # 2. Подготовка движка сборки
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Авторизация в GHCR для скачивания базового образа
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4. Оптимизированный шаг сборки прошивки с кэшированием слоев
+      - name: Build Firmware
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: artifacts
+          outputs: type=local,dest=./build_out
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 5. Загрузка готового .elf файла в артефакты
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stm32-firmware
+          path: build_out/UART_DRIVER.elf
+          retention-days: 7
