@@ -1,11 +1,9 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file    stm32f4xx_hal_conf_template.h
+  * @file    stm32f4xx_hal_conf.h
   * @author  MCD Application Team
-  * @brief   HAL configuration template file.
-  *          This file should be copied to the application folder and renamed
-  *          to stm32f4xx_hal_conf.h.
+  * @brief   HAL configuration file.
   ******************************************************************************
   * @attention
   *
@@ -37,7 +35,7 @@
   */
 #define HAL_MODULE_ENABLED
 
-  /* #define HAL_CRYP_MODULE_ENABLED */
+/* #define HAL_CRYP_MODULE_ENABLED */
 /* #define HAL_ADC_MODULE_ENABLED */
 /* #define HAL_CAN_MODULE_ENABLED */
 /* #define HAL_CRC_MODULE_ENABLED */
@@ -63,8 +61,8 @@
 /* #define HAL_SD_MODULE_ENABLED */
 /* #define HAL_MMC_MODULE_ENABLED */
 /* #define HAL_SPI_MODULE_ENABLED */
-/* #define HAL_TIM_MODULE_ENABLED */
-/* #define HAL_UART_MODULE_ENABLED */
+#define HAL_TIM_MODULE_ENABLED      /* <--- РАСКОММЕНТИРОВАНО ДЛЯ ТАЙМЕРОВ */
+#define HAL_UART_MODULE_ENABLED     /* <--- РАСКОММЕНТИРОВАНО ДЛЯ UART */
 /* #define HAL_USART_MODULE_ENABLED */
 /* #define HAL_IRDA_MODULE_ENABLED */
 /* #define HAL_SMARTCARD_MODULE_ENABLED */
@@ -73,7 +71,6 @@
 /* #define HAL_PCD_MODULE_ENABLED */
 /* #define HAL_HCD_MODULE_ENABLED */
 /* #define HAL_DSI_MODULE_ENABLED */
-/* #define HAL_QSPI_MODULE_ENABLED */
 /* #define HAL_QSPI_MODULE_ENABLED */
 /* #define HAL_CEC_MODULE_ENABLED */
 /* #define HAL_FMPI2C_MODULE_ENABLED */
@@ -147,7 +144,7 @@
 /**
   * @brief This is the HAL system configuration section
   */
-#define  VDD_VALUE		      3300U /*!< Value of VDD in mv */
+#define  VDD_VALUE          3300U /*!< Value of VDD in mv */
 #define  TICK_INT_PRIORITY            15U   /*!< tick interrupt priority */
 #define  USE_RTOS                     0U
 #define  PREFETCH_ENABLE              1U
