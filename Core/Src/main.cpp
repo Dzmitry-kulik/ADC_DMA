@@ -1,10 +1,11 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.cpp
-  * @brief          : PWM Sine + Dual PWM Input Capture + Multi-overflow + TxManager
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.cpp
+ * @brief          : PWM Sine + Dual PWM Input Capture + Multi-overflow +
+ *TxManager
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 #include "main.h"
 
@@ -27,17 +28,13 @@ UART_HandleTypeDef huart1;
 #define SINE_SAMPLES 100
 
 const uint16_t sine_lut[SINE_SAMPLES] = {
-    80, 84, 89, 94, 99, 104, 109, 113, 118, 122,
-    126, 130, 134, 137, 141, 144, 147, 149, 151, 153,
-    155, 157, 158, 158, 159, 159, 159, 158, 158, 157,
-    155, 153, 151, 149, 147, 144, 141, 137, 134, 130,
-    126, 122, 118, 113, 109, 104, 99, 94, 89, 84,
-    80, 75, 70, 65, 60, 55, 50, 46, 41, 37,
-    33, 29, 25, 22, 18, 15, 12, 10, 8, 6,
-    4, 2, 1, 1, 0, 0, 0, 1, 1, 2,
-    4, 6, 8, 10, 12, 15, 18, 22, 25, 29,
-    33, 37, 41, 46, 50, 55, 60, 65, 70, 75
-};
+    80,  84,  89,  94,  99,  104, 109, 113, 118, 122, 126, 130, 134, 137, 141,
+    144, 147, 149, 151, 153, 155, 157, 158, 158, 159, 159, 159, 158, 158, 157,
+    155, 153, 151, 149, 147, 144, 141, 137, 134, 130, 126, 122, 118, 113, 109,
+    104, 99,  94,  89,  84,  80,  75,  70,  65,  60,  55,  50,  46,  41,  37,
+    33,  29,  25,  22,  18,  15,  12,  10,  8,   6,   4,   2,   1,   1,   0,
+    0,   0,   1,   1,   2,   4,   6,   8,   10,  12,  15,  18,  22,  25,  29,
+    33,  37,  41,  46,  50,  55,  60,  65,  70,  75};
 
 /* Переменные расширенного 32-битного Input Capture */
 volatile uint32_t g_tim3_overflows = 0;
@@ -70,14 +67,18 @@ static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
 }
 
-/* Корректный расчёт 32-битного времени с учётом нераспределённого переполнения */
-inline uint32_t get_absolute_capture(TIM_HandleTypeDef *htim, uint32_t channel) {
+/* Корректный расчёт 32-битного времени с учётом нераспределённого переполнения
+ */
+inline uint32_t get_absolute_capture(TIM_HandleTypeDef *htim,
+                                     uint32_t channel) {
   uint32_t overflows = g_tim3_overflows;
   uint32_t ccr = HAL_TIM_ReadCapturedValue(htim, channel);
 
   /* Если прерывание по переполнению ещё не успело обработаться:
-     - ccr < 0x8000 означает, что захват произошёл ПОСЛЕ переполнения -> прибавляем +1
-     - ccr >= 0x8000 означает, что захват произошёл ДО переполнения -> оставляем текущий overflows */
+     - ccr < 0x8000 означает, что захват произошёл ПОСЛЕ переполнения ->
+     прибавляем +1
+     - ccr >= 0x8000 означает, что захват произошёл ДО переполнения -> оставляем
+     текущий overflows */
   if (__HAL_TIM_GET_FLAG(htim, TIM_FLAG_UPDATE) != RESET) {
     if (ccr < 0x8000) {
       overflows++;
@@ -99,7 +100,8 @@ int main(void) {
   MX_USART1_UART_Init();
 
   /* 1. Запуск ШИМ и синуса */
-  HAL_TIM_PWM_Start_DMA(&htim2, TIM_CHANNEL_1, (uint32_t *)sine_lut, SINE_SAMPLES);
+  HAL_TIM_PWM_Start_DMA(&htim2, TIM_CHANNEL_1, (uint32_t *)sine_lut,
+                        SINE_SAMPLES);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
   /* 2. Запуск захвата периода (CH1) и длительности (CH2) */
@@ -132,15 +134,13 @@ int main(void) {
 
         /* Безопасный расчёт скважности с ограничением до 100% */
         uint32_t duty = (pulse * 100) / period;
-        metrics.duty_cycle_percent = static_cast<uint8_t>(duty > 100 ? 100 : duty);
+        metrics.duty_cycle_percent =
+            static_cast<uint8_t>(duty > 100 ? 100 : duty);
 
         bool sent = g_tx_manager.send_frame_with_ack(
-            static_cast<uint8_t>(protocol::MessageType::DATA),
-            g_msg_seq_num,
-            reinterpret_cast<const uint8_t *>(&metrics),
-            sizeof(metrics),
-            ACK_TIMEOUT_MS,
-            MAX_RETRIES);
+            static_cast<uint8_t>(protocol::MessageType::DATA), g_msg_seq_num,
+            reinterpret_cast<const uint8_t *>(&metrics), sizeof(metrics),
+            ACK_TIMEOUT_MS, MAX_RETRIES);
 
         if (sent) {
           g_msg_seq_num++;
@@ -161,7 +161,8 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    Error_Handler();
 
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
                                 RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
@@ -169,12 +170,11 @@ void SystemClock_Config(void) {
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) Error_Handler();
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+    Error_Handler();
 }
 
-static void MX_GPIO_Init(void) {
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-}
+static void MX_GPIO_Init(void) { __HAL_RCC_GPIOA_CLK_ENABLE(); }
 
 static void MX_DMA_Init(void) {
   __HAL_RCC_DMA1_CLK_ENABLE();
@@ -258,21 +258,25 @@ static void MX_TIM3_Init(void) {
   htim3.Init.Period = 65535;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+    Error_Handler();
 
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
   HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig);
-  if (HAL_TIM_IC_Init(&htim3) != HAL_OK) Error_Handler();
+  if (HAL_TIM_IC_Init(&htim3) != HAL_OK)
+    Error_Handler();
 
   sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
   sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
   sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
   sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
+    Error_Handler();
 
   sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
   sConfigIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
-  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+    Error_Handler();
 
   HAL_NVIC_SetPriority(TIM3_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(TIM3_IRQn);
@@ -289,7 +293,8 @@ static void MX_TIM4_Init(void) {
   htim4.Init.Period = 1000 - 1;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK) Error_Handler();
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
+    Error_Handler();
 
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
   HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig);
@@ -316,21 +321,18 @@ static void MX_USART1_UART_Init(void) {
   huart1.Init.Mode = UART_MODE_TX_RX;
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+    Error_Handler();
 }
 
-/* 
+/*
  * ОБРАБОТЧИКИ ПРЕРЫВАНИЙ И CALLBACK
  */
 extern "C" {
 
-void DMA1_Stream5_IRQHandler(void) {
-  HAL_DMA_IRQHandler(&hdma_tim2_ch1);
-}
+void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
 
-void TIM3_IRQHandler(void) {
-  HAL_TIM_IRQHandler(&htim3);
-}
+void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
 
 /* Обработчик переполнения таймера TIM3 (вызывается из HAL_TIM_IRQHandler) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
@@ -354,8 +356,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
       }
       g_t_rising_prev = t_rising_curr;
       g_has_first_rising = true;
-    } 
-    else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
+    } else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
       if (g_has_first_rising) {
         uint32_t t_falling = get_absolute_capture(htim, TIM_CHANNEL_2);
         g_measured_pulse_ticks = t_falling - g_t_rising_prev;
@@ -366,7 +367,8 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
 
 void Error_Handler(void) {
   __disable_irq();
-  while (1) {}
+  while (1) {
+  }
 }
 
 #ifdef USE_FULL_ASSERT
