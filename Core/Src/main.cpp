@@ -3,7 +3,7 @@
  ******************************************************************************
  * @file           : main.cpp
  * @brief          : PWM Sine + Dual PWM Input Capture + Multi-overflow +
- *TxManager
+ *TxManager (HW DMA)
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -23,6 +23,7 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3; /* PWM Input Capture на PA6 */
 TIM_HandleTypeDef htim4; /* Ежесекундный будильник */
 DMA_HandleTypeDef hdma_tim2_ch1;
+DMA_HandleTypeDef hdma_usart1_tx; /* Добавлен DMA для передачи по UART */
 UART_HandleTypeDef huart1;
 
 #define SINE_SAMPLES 100
@@ -74,11 +75,6 @@ inline uint32_t get_absolute_capture(TIM_HandleTypeDef *htim,
   uint32_t overflows = g_tim3_overflows;
   uint32_t ccr = HAL_TIM_ReadCapturedValue(htim, channel);
 
-  /* Если прерывание по переполнению ещё не успело обработаться:
-     - ccr < 0x8000 означает, что захват произошёл ПОСЛЕ переполнения ->
-     прибавляем +1
-     - ccr >= 0x8000 означает, что захват произошёл ДО переполнения -> оставляем
-     текущий overflows */
   if (__HAL_TIM_GET_FLAG(htim, TIM_FLAG_UPDATE) != RESET) {
     if (ccr < 0x8000) {
       overflows++;
@@ -132,7 +128,6 @@ int main(void) {
         PwmMetrics metrics{};
         metrics.frequency_hz = 16000000 / period;
 
-        /* Безопасный расчёт скважности с ограничением до 100% */
         uint32_t duty = (pulse * 100) / period;
         metrics.duty_cycle_percent =
             static_cast<uint8_t>(duty > 100 ? 100 : duty);
@@ -177,9 +172,17 @@ void SystemClock_Config(void) {
 static void MX_GPIO_Init(void) { __HAL_RCC_GPIOA_CLK_ENABLE(); }
 
 static void MX_DMA_Init(void) {
+  /* Включаем тактирование обоих контроллеров DMA */
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* Прерывания для таймера TIM2 (DMA1) */
   HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+
+  /* Прерывания для UART (DMA2) */
+  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
 }
 
 static void MX_TIM2_Init(void) {
@@ -190,7 +193,6 @@ static void MX_TIM2_Init(void) {
 
   __HAL_RCC_TIM2_CLK_ENABLE();
 
-  /* ИСПРАВЛЕНО: Настройки для 100 кГц ШИМ */
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -207,18 +209,15 @@ static void MX_TIM2_Init(void) {
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig);
 
-  /* Канал 1 (PA0): Синусоидальная ШИМ через DMA */
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1);
 
-  /* Канал 2 (PA1): Статическая ШИМ (75% от 159 = 119) */
   sConfigOC.Pulse = 119;
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
 
-  /* Высокая скорость GPIO для чётких фронтов ШИМ */
   GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -326,6 +325,22 @@ static void MX_USART1_UART_Init(void) {
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   if (HAL_UART_Init(&huart1) != HAL_OK)
     Error_Handler();
+
+  /* Инициализация DMA для USART1_TX (Stream 7, Channel 4 на STM32F411) */
+  hdma_usart1_tx.Instance = DMA2_Stream7;
+  hdma_usart1_tx.Init.Channel = DMA_CHANNEL_4;
+  hdma_usart1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
+  hdma_usart1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
+  hdma_usart1_tx.Init.MemInc = DMA_MINC_ENABLE;
+  hdma_usart1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+  hdma_usart1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+  hdma_usart1_tx.Init.Mode = DMA_NORMAL;
+  hdma_usart1_tx.Init.Priority = DMA_PRIORITY_LOW;
+  hdma_usart1_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+  if (HAL_DMA_Init(&hdma_usart1_tx) != HAL_OK)
+    Error_Handler();
+
+  __HAL_LINKDMA(&huart1, hdmatx, hdma_usart1_tx);
 }
 
 /*
@@ -335,9 +350,11 @@ extern "C" {
 
 void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
 
+/* Добавлен обработчик прерывания DMA для отправки UART */
+void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }
+
 void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
 
-/* Обработчик переполнения таймера TIM3 (вызывается из HAL_TIM_IRQHandler) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM3) {
     g_tim3_overflows++;
