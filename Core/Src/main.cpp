@@ -190,10 +190,11 @@ static void MX_TIM2_Init(void) {
 
   __HAL_RCC_TIM2_CLK_ENABLE();
 
+  /* ИСПРАВЛЕНО: Настройки для 100 кГц ШИМ */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 1599;
+  htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 999;
+  htim2.Init.Period = 159;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   HAL_TIM_Base_Init(&htim2);
@@ -206,16 +207,18 @@ static void MX_TIM2_Init(void) {
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig);
 
+  /* Канал 1 (PA0): Синусоидальная ШИМ через DMA */
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1);
 
-  sConfigOC.Pulse = 500;
+  /* Канал 2 (PA1): Статическая ШИМ (75% от 159 = 119) */
+  sConfigOC.Pulse = 119;
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
 
-  /* Увеличена скорость GPIO для ровных фронтов ШИМ */
+  /* Высокая скорость GPIO для чётких фронтов ШИМ */
   GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
