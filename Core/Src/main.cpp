@@ -80,6 +80,7 @@ static uint8_t g_msg_seq_num = 0;
 
 constexpr uint32_t ACK_TIMEOUT_MS = 200;
 constexpr uint8_t MAX_RETRIES = 3;
+constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 300; /* Интервал мигания 300 мс */
 
 /* Private function prototypes -----------------------------------------------*/
 extern "C" {
@@ -188,11 +189,11 @@ int main(void) {
     }
 
     /* ==============================================================================
-     * АСИНХРОННЫЙ LED
+     * АСИНХРОННЫЙ LED (Период мигания увеличен)
      * ==============================================================================
      */
     if (led_blink_count > 0) {
-      if (HAL_GetTick() - led_timer > 80) {
+      if (HAL_GetTick() - led_timer > LED_TOGGLE_INTERVAL_MS) {
         led_timer = HAL_GetTick();
         static bool led_state = false;
         led_state = !led_state;
@@ -470,7 +471,6 @@ static void MX_TIM5_Init(void) {
   HAL_NVIC_EnableIRQ(TIM5_IRQn);
 }
 
-/* ИСПРАВЛЕНО: UART1 перенесен на безопасные пины PB6 (TX) / PB7 (RX) */
 static void MX_USART1_UART_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -510,7 +510,6 @@ static void MX_USART1_UART_Init(void) {
 
   __HAL_LINKDMA(&huart1, hdmatx, hdma_usart1_tx);
 
-  /* Включение прерывания USART1 в NVIC для приема ACK */
   HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
@@ -523,7 +522,6 @@ extern "C" {
 void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
 void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }
 
-/* Прерывание приема UART */
 void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }
 
 void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
