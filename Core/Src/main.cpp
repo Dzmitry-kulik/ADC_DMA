@@ -22,8 +22,8 @@
 TIM_HandleTypeDef htim1; /* ISR duration measurement on PA8 */
 TIM_HandleTypeDef htim2; /* 100 kHz PWM on PA0 and PA1 */
 TIM_HandleTypeDef htim3; /* PWM Input Capture on PA6 */
-TIM_HandleTypeDef htim4; /* 1-second alarm timer */
-TIM_HandleTypeDef htim5; /* Debounce timer (1 ms) */
+TIM_HandleTypeDef htim4; /* High-frequency telemetry timer (50 Hz) */
+TIM_HandleTypeDef htim5; /* Debounce & sine stepping timer (1 ms) */
 
 DMA_HandleTypeDef hdma_tim2_ch1;
 DMA_HandleTypeDef hdma_usart1_tx;
@@ -127,9 +127,8 @@ int main(void) {
 
   LED_PC13_OFF();
 
-  /* 1. Start PWM and Sine generation */
-  HAL_TIM_PWM_Start_DMA(&htim2, TIM_CHANNEL_1, (uint32_t *)sine_lut,
-                        SINE_SAMPLES);
+  /* 1. Start standard PWM output (sine duty cycle is updated in TIM5 ISR) */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
   /* 2. Start PWM period capture (TIM3) */
@@ -141,11 +140,11 @@ int main(void) {
   HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
 
-  /* 4. Configure 1-second timer (TIM4) */
+  /* 4. Configure telemetry timer (TIM4 - 50 Hz / 20 ms interval) */
   __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
   HAL_TIM_Base_Start(&htim4);
 
-  /* 5. Start debounce timer (1 ms) */
+  /* 5. Start debounce and sine step timer (TIM5 - 1 ms) */
   HAL_TIM_Base_Start_IT(&htim5);
 
   BtnState btn_fsm = BtnState::IDLE;
@@ -196,7 +195,7 @@ int main(void) {
     }
 
     /* ==============================================================================
-     * ASYNCHRONOUS LED
+     * ASYNCHRONOUS LED INDICATOR
      * ==============================================================================
      */
     if (led_blink_count > 0) {
@@ -215,7 +214,7 @@ int main(void) {
     }
 
     /* ==============================================================================
-     * TELEMETRY TRANSMISSION (1 Hz)
+     * TELEMETRY TRANSMISSION (50 Hz / Every 20 ms)
      * ==============================================================================
      */
     if (__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_UPDATE)) {
@@ -447,13 +446,15 @@ static void MX_TIM3_Init(void) {
   HAL_NVIC_EnableIRQ(TIM3_IRQn);
 }
 
+/* MODIFIED: Prescaled to 10 kHz clock; period set to 200 ticks = 50 Hz (20 ms
+ * interval) */
 static void MX_TIM4_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   __HAL_RCC_TIM4_CLK_ENABLE();
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 16000 - 1;
+  htim4.Init.Prescaler = 1600 - 1; /* 16 MHz / 1600 = 10 kHz clock */
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 1000 - 1;
+  htim4.Init.Period = 200 - 1; /* 10 kHz / 200 = 50 Hz interrupt rate */
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
     Error_Handler();
@@ -478,7 +479,7 @@ static void MX_TIM5_Init(void) {
   HAL_NVIC_EnableIRQ(TIM5_IRQn);
 }
 
-/* FIXED: UART1 remapped to safe pins PB6 (TX) / PB7 (RX) */
+/* UART1 mapped to safe pins PB6 (TX) / PB7 (RX) */
 static void MX_USART1_UART_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -530,17 +531,42 @@ extern "C" {
 void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
 void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }
 
-void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }
+/* MODIFIED: Automatic recovery from ORE, NE, and FE hardware errors */
+void USART1_IRQHandler(void) {
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET) {
+    __HAL_UART_CLEAR_OREFLAG(&huart1);
+  }
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_NE) != RESET) {
+    __HAL_UART_CLEAR_NEFLAG(&huart1);
+  }
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_FE) != RESET) {
+    __HAL_UART_CLEAR_FEFLAG(&huart1);
+  }
+
+  HAL_UART_IRQHandler(&huart1);
+}
 
 void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
 void TIM1_CC_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }
 
+/* MODIFIED: Adds slow software sine step (every 50 ms = 5 s period) alongside
+ * button debouncing */
 void TIM5_IRQHandler(void) {
   DEBUG_PIN_HIGH(); /* Pulse high on PB1 (ISR measurement start) */
 
   if (__HAL_TIM_GET_FLAG(&htim5, TIM_FLAG_UPDATE)) {
     __HAL_TIM_CLEAR_IT(&htim5, TIM_IT_UPDATE);
 
+    /* Software sine wave stepping: 50 ms per step = 5.0 s total period */
+    static uint32_t sine_timer = 0;
+    static uint16_t sine_index = 0;
+    if (++sine_timer >= 50) {
+      sine_timer = 0;
+      TIM2->CCR1 = sine_lut[sine_index];
+      sine_index = (sine_index + 1) % SINE_SAMPLES;
+    }
+
+    /* Button debouncing logic */
     static uint16_t history = 0x0000;
     history = (history << 1) | (BTN_READ() ? 1 : 0);
 
