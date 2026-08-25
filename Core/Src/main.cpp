@@ -19,11 +19,11 @@
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
-TIM_HandleTypeDef htim1; /* Измерение длительности ISR на PA8 */
-TIM_HandleTypeDef htim2; /* ШИМ 100 кГц на PA0 и PA1 */
-TIM_HandleTypeDef htim3; /* PWM Input Capture на PA6 */
-TIM_HandleTypeDef htim4; /* Ежесекундный будильник */
-TIM_HandleTypeDef htim5; /* Антидребезг (1 мс) */
+TIM_HandleTypeDef htim1; /* ISR duration measurement on PA8 */
+TIM_HandleTypeDef htim2; /* 100 kHz PWM on PA0 and PA1 */
+TIM_HandleTypeDef htim3; /* PWM Input Capture on PA6 */
+TIM_HandleTypeDef htim4; /* 1-second alarm timer */
+TIM_HandleTypeDef htim5; /* Debounce timer (1 ms) */
 
 DMA_HandleTypeDef hdma_tim2_ch1;
 DMA_HandleTypeDef hdma_usart1_tx;
@@ -41,19 +41,18 @@ const uint16_t sine_lut[SINE_SAMPLES] = {
     33,  37,  41,  46,  50,  55,  60,  65,  70,  75};
 
 /* ==============================================================================
- * АТОМАРНАЯ РАБОТА С ПИНАМИ ЧЕРЕЗ BSRR / IDR (1 такт)
+ * ATOMIC PIN OPERATIONS VIA BSRR / IDR (1 cycle)
  * ==============================================================================
  */
-#define BTN_READ()                                                             \
-  ((GPIOB->IDR & GPIO_PIN_0) == 0) /* true, если нажата (0)          \
-                                    */
-#define DEBUG_PIN_HIGH() (GPIOB->BSRR = GPIO_PIN_1)        /* PB1 High */
-#define DEBUG_PIN_LOW() (GPIOB->BSRR = (GPIO_PIN_1 << 16)) /* PB1 Low */
-#define LED_PC13_ON() (GPIOC->BSRR = (GPIO_PIN_13 << 16))  /* PC13 Low (On) */
-#define LED_PC13_OFF() (GPIOC->BSRR = GPIO_PIN_13)         /* PC13 High (Off) */
+#define BTN_READ() ((GPIOB->IDR & GPIO_PIN_0) == 0) /* true if pressed (0) */
+#define DEBUG_PIN_HIGH() (GPIOB->BSRR = GPIO_PIN_1) /* PB1 High (ISR Start) */
+#define DEBUG_PIN_LOW()                                                        \
+  (GPIOB->BSRR = (GPIO_PIN_1 << 16)) /* PB1 Low (ISR End) */
+#define LED_PC13_ON() (GPIOC->BSRR = (GPIO_PIN_13 << 16)) /* PC13 Low (On) */
+#define LED_PC13_OFF() (GPIOC->BSRR = GPIO_PIN_13)        /* PC13 High (Off) */
 
 /* ==============================================================================
- * ПЕРЕМЕННЫЕ
+ * GLOBAL VARIABLES
  * ==============================================================================
  */
 volatile uint32_t g_tim3_overflows = 0;
@@ -62,6 +61,8 @@ volatile uint32_t g_measured_period_ticks = 0;
 volatile uint32_t g_measured_pulse_ticks = 0;
 volatile bool g_has_first_rising = false;
 
+/* Global variable to store ISR execution duration (in 16 MHz ticks = 62.5 ns)
+ */
 volatile uint32_t g_isr_duration_ticks = 0;
 
 volatile bool g_btn_event = false;
@@ -78,9 +79,14 @@ protocol::DiagnosticsStats g_stats{};
 protocol::UartTxManager g_tx_manager(huart1);
 static uint8_t g_msg_seq_num = 0;
 
+/* Timing and protocol constants */
 constexpr uint32_t ACK_TIMEOUT_MS = 200;
 constexpr uint8_t MAX_RETRIES = 3;
-constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 300; /* Интервал мигания 300 мс */
+constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 300; /* LED toggle interval (ms) */
+constexpr uint32_t SHORT_PRESS_TIMEOUT_MS =
+    300; /* Double-click wait window (ms) */
+constexpr uint32_t LONG_PRESS_THRESHOLD_MS =
+    1000; /* Long press threshold (ms) */
 
 /* Private function prototypes -----------------------------------------------*/
 extern "C" {
@@ -121,25 +127,25 @@ int main(void) {
 
   LED_PC13_OFF();
 
-  /* 1. Запуск ШИМ и синуса */
+  /* 1. Start PWM and Sine generation */
   HAL_TIM_PWM_Start_DMA(&htim2, TIM_CHANNEL_1, (uint32_t *)sine_lut,
                         SINE_SAMPLES);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
-  /* 2. Запуск захвата периода ШИМ (TIM3) */
+  /* 2. Start PWM period capture (TIM3) */
   __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
 
-  /* 3. Запуск замера времени ISR (TIM1) */
+  /* 3. Start ISR execution time measurement (TIM1) */
   HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
 
-  /* 4. Настройка секундного таймера (TIM4) */
+  /* 4. Configure 1-second timer (TIM4) */
   __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
   HAL_TIM_Base_Start(&htim4);
 
-  /* 5. Запуск антидребезга (1 мс) */
+  /* 5. Start debounce timer (1 ms) */
   HAL_TIM_Base_Start_IT(&htim5);
 
   BtnState btn_fsm = BtnState::IDLE;
@@ -152,22 +158,22 @@ int main(void) {
     g_tx_manager.process_timeouts(HAL_GetTick());
 
     /* ==============================================================================
-     * КОНЕЧНЫЙ АВТОМАТ КНОПОК
+     * BUTTON FINITE STATE MACHINE (FSM)
      * ==============================================================================
      */
     if (g_btn_event) {
       g_btn_event = false;
-      if (g_btn_state) { /* Нажата */
+      if (g_btn_state) { /* Pressed */
         if (btn_fsm == BtnState::IDLE) {
           btn_fsm = BtnState::PRESSED;
           press_time = HAL_GetTick();
         } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
           btn_fsm = BtnState::IDLE;
-          led_blink_count = 4; /* Двойной клик -> 2 вспышки */
+          led_blink_count = 4; /* Double click -> 2 blinks */
         }
-      } else { /* Отпущена */
+      } else { /* Released */
         if (btn_fsm == BtnState::PRESSED) {
-          if (HAL_GetTick() - press_time > 1000) {
+          if (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS) {
             btn_fsm = BtnState::IDLE;
           } else {
             btn_fsm = BtnState::WAIT_DOUBLE;
@@ -178,18 +184,19 @@ int main(void) {
     }
 
     if (btn_fsm == BtnState::WAIT_DOUBLE &&
-        (HAL_GetTick() - press_time > 300)) {
+        (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
       btn_fsm = BtnState::IDLE;
-      led_blink_count = 2; /* Короткий клик -> 1 вспышка */
+      led_blink_count = 2; /* Short click -> 1 blink */
     }
 
-    if (btn_fsm == BtnState::PRESSED && (HAL_GetTick() - press_time > 1000)) {
+    if (btn_fsm == BtnState::PRESSED &&
+        (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
       btn_fsm = BtnState::IDLE;
-      led_blink_count = 10; /* Длинное удержание -> 5 вспышек */
+      led_blink_count = 10; /* Long press -> 5 blinks */
     }
 
     /* ==============================================================================
-     * АСИНХРОННЫЙ LED (Период мигания увеличен)
+     * ASYNCHRONOUS LED
      * ==============================================================================
      */
     if (led_blink_count > 0) {
@@ -208,7 +215,7 @@ int main(void) {
     }
 
     /* ==============================================================================
-     * ОТПРАВКА ТЕЛЕМЕТРИИ (1 Гц)
+     * TELEMETRY TRANSMISSION (1 Hz)
      * ==============================================================================
      */
     if (__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_UPDATE)) {
@@ -285,7 +292,7 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* PB0 Кнопка */
+  /* PB0 Button */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -471,6 +478,7 @@ static void MX_TIM5_Init(void) {
   HAL_NVIC_EnableIRQ(TIM5_IRQn);
 }
 
+/* FIXED: UART1 remapped to safe pins PB6 (TX) / PB7 (RX) */
 static void MX_USART1_UART_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -515,7 +523,7 @@ static void MX_USART1_UART_Init(void) {
 }
 
 /*
- * ОБРАБОТЧИКИ ПРЕРЫВАНИЙ И CALLBACK
+ * INTERRUPT HANDLERS AND CALLBACKS
  */
 extern "C" {
 
@@ -528,7 +536,7 @@ void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
 void TIM1_CC_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }
 
 void TIM5_IRQHandler(void) {
-  DEBUG_PIN_HIGH();
+  DEBUG_PIN_HIGH(); /* Pulse high on PB1 (ISR measurement start) */
 
   if (__HAL_TIM_GET_FLAG(&htim5, TIM_FLAG_UPDATE)) {
     __HAL_TIM_CLEAR_IT(&htim5, TIM_IT_UPDATE);
@@ -548,12 +556,13 @@ void TIM5_IRQHandler(void) {
     }
   }
 
-  DEBUG_PIN_LOW();
+  DEBUG_PIN_LOW(); /* Pulse low on PB1 (ISR measurement end) */
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM3) {
-    g_tim3_overflows++;
+    g_tim3_overflows =
+        g_tim3_overflows + 1; /* Explicit assignment to avoid C++20 warning */
   }
 }
 
@@ -563,6 +572,8 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
   }
 }
 
+/* Input Capture Callback: Hardware measurement of PB1 strobe width on pin PA8
+ */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM3) {
     if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
@@ -580,10 +591,12 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     }
   }
 
+  /* High level duration measurement on PA8 (TIM1_CH1 -> CH2) */
   if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
     uint32_t start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
     uint32_t end = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
 
+    /* Calculate and store ISR duration into global variable */
     g_isr_duration_ticks =
         (end >= start) ? (end - start) : ((0xFFFF - start) + end + 1);
   }
