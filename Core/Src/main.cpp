@@ -20,7 +20,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim1; /* ISR duration measurement on PA8 */
-TIM_HandleTypeDef htim2; /* 100 kHz PWM on PA0 and PA1 */
+TIM_HandleTypeDef htim2; /* 10 kHz PWM on PA0 and PA1 */
 TIM_HandleTypeDef htim3; /* PWM Input Capture on PA6 */
 TIM_HandleTypeDef htim4; /* High-frequency telemetry timer (50 Hz) */
 TIM_HandleTypeDef htim5; /* Debounce & sine stepping timer (1 ms) */
@@ -31,14 +31,16 @@ UART_HandleTypeDef huart1;
 
 #define SINE_SAMPLES 100
 
+/* Scaled LUT values x10 for 10 kHz carrier (ARR = 1599) */
 const uint16_t sine_lut[SINE_SAMPLES] = {
-    80,  84,  89,  94,  99,  104, 109, 113, 118, 122, 126, 130, 134, 137,
-    141, 144, 147, 149, 151, 153, 155, 157, 158, 158, 159, 159, 159, 158,
-    158, 157, 155, 153, 151, 149, 147, 144, 141, 137, 134, 130, 126, 122,
-    118, 113, 109, 104, 99,  94,  89,  84,  80,  75,  70,  65,  60,  55,
-    50,  46,  41,  37,  33,  29,  25,  22,  18,  15,  12,  10,  8,   6,
-    5,   5,   5,   5,   5,   5,   5,   6,   8,   10,  12,  15,  18,  22,
-    25,  29,  33,  37,  41,  46,  50,  55,  60,  65,  70,  75};
+    800,  840,  890,  940,  990,  1040, 1090, 1130, 1180, 1220, 1260, 1300,
+    1340, 1370, 1410, 1440, 1470, 1490, 1510, 1530, 1550, 1570, 1580, 1580,
+    1590, 1590, 1590, 1580, 1580, 1570, 1550, 1530, 1510, 1490, 1470, 1440,
+    1410, 1370, 1340, 1300, 1260, 1220, 1180, 1130, 1090, 1040, 990,  940,
+    890,  840,  800,  750,  700,  650,  600,  550,  500,  460,  410,  370,
+    330,  290,  250,  220,  180,  150,  120,  100,  80,   60,   50,   50,
+    50,   50,   50,   50,   50,   60,   80,   100,  120,  150,  180,  220,
+    250,  290,  330,  370,  410,  460,  500,  550,  600,  650,  700,  750};
 
 /* ==============================================================================
  * ATOMIC PIN OPERATIONS VIA BSRR / IDR (1 cycle)
@@ -348,6 +350,7 @@ static void MX_TIM1_Init(void) {
   HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
 }
 
+/* MODIFIED: Prescaled Period to 1599 for 10 kHz PWM carrier */
 static void MX_TIM2_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
@@ -359,7 +362,7 @@ static void MX_TIM2_Init(void) {
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 159;
+  htim2.Init.Period = 1599; /* 16 MHz / 1600 = 10 kHz PWM */
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   HAL_TIM_Base_Init(&htim2);
@@ -378,7 +381,7 @@ static void MX_TIM2_Init(void) {
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1);
 
-  sConfigOC.Pulse = 119;
+  sConfigOC.Pulse = 1190; /* Scaled to ~75% of 1600 */
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
 
   GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
@@ -446,8 +449,6 @@ static void MX_TIM3_Init(void) {
   HAL_NVIC_EnableIRQ(TIM3_IRQn);
 }
 
-/* MODIFIED: Prescaled to 10 kHz clock; period set to 200 ticks = 50 Hz (20 ms
- * interval) */
 static void MX_TIM4_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   __HAL_RCC_TIM4_CLK_ENABLE();
@@ -479,7 +480,6 @@ static void MX_TIM5_Init(void) {
   HAL_NVIC_EnableIRQ(TIM5_IRQn);
 }
 
-/* UART1 mapped to safe pins PB6 (TX) / PB7 (RX) */
 static void MX_USART1_UART_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -531,7 +531,6 @@ extern "C" {
 void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
 void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }
 
-/* MODIFIED: Automatic recovery from ORE, NE, and FE hardware errors */
 void USART1_IRQHandler(void) {
   if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET) {
     __HAL_UART_CLEAR_OREFLAG(&huart1);
@@ -549,8 +548,6 @@ void USART1_IRQHandler(void) {
 void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
 void TIM1_CC_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }
 
-/* MODIFIED: Adds slow software sine step (every 50 ms = 5 s period) alongside
- * button debouncing */
 void TIM5_IRQHandler(void) {
   DEBUG_PIN_HIGH(); /* Pulse high on PB1 (ISR measurement start) */
 
