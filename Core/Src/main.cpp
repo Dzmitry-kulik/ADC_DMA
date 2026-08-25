@@ -84,7 +84,7 @@ static uint8_t g_msg_seq_num = 0;
 /* Timing and protocol constants */
 constexpr uint32_t ACK_TIMEOUT_MS = 200;
 constexpr uint8_t MAX_RETRIES = 3;
-constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 300; /* LED toggle interval (ms) */
+constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 2000; /* LED toggle interval (ms) */
 constexpr uint32_t SHORT_PRESS_TIMEOUT_MS =
     300; /* Double-click wait window (ms) */
 constexpr uint32_t LONG_PRESS_THRESHOLD_MS =
