@@ -127,7 +127,7 @@ int main(void) {
 
   LED_PC13_OFF();
 
-  /* ИСПРАВЛЕНО: Запускаем ШИМ только на PA1 (Канал 2) */
+  /* Запускаем ШИМ только на PA1 (Канал 2) */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
@@ -163,7 +163,6 @@ int main(void) {
         } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
           btn_fsm = BtnState::IDLE;
           g_current_fsm_mode = 2; /* [DOUBLE CLICK] */
-          TIM2->ARR = 1599;
         }
       } else { /* Кнопка отпущена */
         if (btn_fsm == BtnState::PRESSED) {
@@ -181,14 +180,12 @@ int main(void) {
         (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
       btn_fsm = BtnState::IDLE;
       g_current_fsm_mode = 1; /* [SHORT CLICK] */
-      TIM2->ARR = 3199;
     }
 
     if (btn_fsm == BtnState::PRESSED &&
         (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
       btn_fsm = BtnState::IDLE;
       g_current_fsm_mode = 3; /* [LONG PRESS] */
-      TIM2->ARR = 799;
     }
 
     if (led_blink_count > 0) {
@@ -360,10 +357,10 @@ static void MX_TIM2_Init(void) {
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
 
-  /* ИСПРАВЛЕНО: Генерируем ШИМ только на Канале 2 (PA1) */
+  /* Генерируем ШИМ только на Канале 2 (PA1) */
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
 
-  /* ИСПРАВЛЕНО: Настраиваем как выход ШИМ только пин PA1 (оставляя PA0
+  /* Настраиваем как выход ШИМ только пин PA1 (оставляя PA0
    * свободной кнопкой) */
   GPIO_InitStruct.Pin = GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -528,7 +525,7 @@ void TIM5_IRQHandler(void) {
     static uint16_t sine_index = 0;
     if (++sine_timer >= 50) {
       sine_timer = 0;
-      /* ИСПРАВЛЕНО: Обновляем только PA1 (Канал 2) */
+      /* Обновляем только PA1 (Канал 2) */
       TIM2->CCR2 = sine_lut[sine_index];
       sine_index = (sine_index + 1) % SINE_SAMPLES;
     }
