@@ -84,7 +84,9 @@ static uint8_t g_msg_seq_num = 0;
 /* Timing and protocol constants */
 constexpr uint32_t ACK_TIMEOUT_MS = 200;
 constexpr uint8_t MAX_RETRIES = 3;
-constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 2000; /* LED toggle interval (ms) */
+/* MODIFIED: Increased interval from 300ms/20000ms to 750ms for clearly visible
+ * toggling */
+constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 750; /* LED toggle interval (ms) */
 constexpr uint32_t SHORT_PRESS_TIMEOUT_MS =
     300; /* Double-click wait window (ms) */
 constexpr uint32_t LONG_PRESS_THRESHOLD_MS =
@@ -170,7 +172,8 @@ int main(void) {
           press_time = HAL_GetTick();
         } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
           btn_fsm = BtnState::IDLE;
-          led_blink_count = 4; /* Double click -> 2 blinks */
+          /* MODIFIED: Double click -> 4 toggles (2 on, 2 off) */
+          led_blink_count = 4;
         }
       } else { /* Released */
         if (btn_fsm == BtnState::PRESSED) {
@@ -187,13 +190,15 @@ int main(void) {
     if (btn_fsm == BtnState::WAIT_DOUBLE &&
         (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
       btn_fsm = BtnState::IDLE;
-      led_blink_count = 2; /* Short click -> 1 blink */
+      /* MODIFIED: Short click -> 2 toggles (1 on, 1 off) */
+      led_blink_count = 2;
     }
 
     if (btn_fsm == BtnState::PRESSED &&
         (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
       btn_fsm = BtnState::IDLE;
-      led_blink_count = 10; /* Long press -> 5 blinks */
+      /* MODIFIED: Long press -> 10 toggles (5 on, 5 off) */
+      led_blink_count = 10;
     }
 
     /* ==============================================================================
@@ -350,7 +355,6 @@ static void MX_TIM1_Init(void) {
   HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
 }
 
-/* MODIFIED: Prescaled Period to 1599 for 10 kHz PWM carrier */
 static void MX_TIM2_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
