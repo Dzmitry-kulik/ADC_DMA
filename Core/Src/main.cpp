@@ -2,114 +2,132 @@
 /**
  ******************************************************************************
  * @file           : main.cpp
- * @brief          : PWM Sine + Dual PWM IC + FSM Button + ISR Profiling + HW
- *UART
+ * @brief          : FSM Button (PA0) + DSP Filters + Oversampling + Volts 
+ *                   + JSON UART + SPWM (PA5) + PWM (PA1)
  ******************************************************************************
  */
 /* USER CODE END Header */
 #include "main.h"
-
-/* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
 
-#include "diagnostics.hpp"
-#include "frame.hpp"
-#include "tx_manager.hpp"
-/* USER CODE END Includes */
-
-/* Private variables ---------------------------------------------------------*/
-TIM_HandleTypeDef htim1; /* ISR duration measurement on PA8 */
-TIM_HandleTypeDef htim2; /* 10 kHz PWM on PA1 (WeAct Config) */
-TIM_HandleTypeDef htim3; /* PWM Input Capture on PA6 */
-TIM_HandleTypeDef htim4; /* High-frequency telemetry timer (50 Hz) */
-TIM_HandleTypeDef htim5; /* Debounce & sine stepping timer (1 ms) */
-
-DMA_HandleTypeDef hdma_tim2_ch1;
-DMA_HandleTypeDef hdma_usart1_tx;
-UART_HandleTypeDef huart1;
-
-#define SINE_SAMPLES 100
-
-/* Scaled LUT values x10 for 10 kHz carrier (ARR = 1599) */
-const uint16_t sine_lut[SINE_SAMPLES] = {
-    800,  840,  890,  940,  990,  1040, 1090, 1130, 1180, 1220, 1260, 1300,
-    1340, 1370, 1410, 1440, 1470, 1490, 1510, 1530, 1550, 1570, 1580, 1580,
-    1590, 1590, 1590, 1580, 1580, 1570, 1550, 1530, 1510, 1490, 1470, 1440,
-    1410, 1370, 1340, 1300, 1260, 1220, 1180, 1130, 1090, 1040, 990,  940,
-    890,  840,  800,  750,  700,  650,  600,  550,  500,  460,  410,  370,
-    330,  290,  250,  220,  180,  150,  120,  100,  80,   60,   50,   50,
-    50,   50,   50,   50,   50,   60,   80,   100,  120,  150,  180,  220,
-    250,  290,  330,  370,  410,  460,  500,  550,  600,  650,  700,  750};
-
 /* ==============================================================================
- * ATOMIC PIN OPERATIONS VIA BSRR / IDR (1 cycle)
+ * КОНФИГ КАЛИБРОВКИ (ИНЖЕНЕРНЫЕ ЕДИНИЦЫ)
  * ==============================================================================
  */
-#define BTN_READ() ((GPIOA->IDR & GPIO_PIN_0) == 0) /* true if pressed (0) */
-#define DEBUG_PIN_HIGH() (GPIOB->BSRR = GPIO_PIN_1) /* PB1 High (ISR Start) */
-#define DEBUG_PIN_LOW()                                                        \
-  (GPIOB->BSRR = (GPIO_PIN_1 << 16)) /* PB1 Low (ISR End) */
-#define LED_PC13_ON() (GPIOC->BSRR = (GPIO_PIN_13 << 16)) /* PC13 Low (On) */
-#define LED_PC13_OFF() (GPIOC->BSRR = GPIO_PIN_13)        /* PC13 High (Off) */
-
-/* ==============================================================================
- * GLOBAL VARIABLES
- * ==============================================================================
- */
-volatile uint32_t g_tim3_overflows = 0;
-volatile uint32_t g_t_rising_prev = 0;
-volatile uint32_t g_measured_period_ticks = 0;
-volatile uint32_t g_measured_pulse_ticks = 0;
-volatile bool g_has_first_rising = false;
-
-volatile uint32_t g_isr_duration_ticks = 0;
-
-volatile bool g_btn_event = false;
-volatile bool g_btn_state = false;
-enum class BtnState { IDLE, PRESSED, WAIT_DOUBLE };
-
-volatile uint8_t g_current_fsm_mode = 0;
-
-struct __attribute__((packed)) PwmMetrics {
-  uint32_t frequency_hz;
-  uint8_t duty_cycle_percent;
-  uint16_t isr_time_ticks;
-  uint8_t btn_event;
+struct CalibrationConfig {
+    float v_ref;        // Опорное напряжение АЦП (Вольты)
+    float offset;       // Смещение нуля (Вольты)
+    float gain;         // Коэффициент усиления (делитель напряжения)
 };
 
-protocol::DiagnosticsStats g_stats{};
-protocol::UartTxManager g_tx_manager(huart1);
-static uint8_t g_msg_seq_num = 0;
+// Конфиг: АЦП запитан от 3.3В, без смещения, читаем напрямую 1:1
+const CalibrationConfig sensor_cfg = {3.3f, 0.0f, 1.0f};
 
-constexpr uint32_t ACK_TIMEOUT_MS = 200;
-constexpr uint8_t MAX_RETRIES = 3;
-constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 750;
-constexpr uint32_t SHORT_PRESS_TIMEOUT_MS = 300;
-constexpr uint32_t LONG_PRESS_THRESHOLD_MS = 1000;
+/* Функции перевода попугаев АЦП в Вольты */
+float adc12_to_volts(uint16_t raw_12bit) {
+    return ((float)raw_12bit / 4095.0f) * sensor_cfg.v_ref * sensor_cfg.gain + sensor_cfg.offset;
+}
 
-/* Private function prototypes -----------------------------------------------*/
+float adc16_to_volts(uint16_t os_16bit) {
+    return ((float)os_16bit / 65535.0f) * sensor_cfg.v_ref * sensor_cfg.gain + sensor_cfg.offset;
+}
+
+/* ==============================================================================
+ * НАСТРОЙКИ АЦП И БУФЕРОВ
+ * ==============================================================================
+ */
+#define NUM_ADC_CHANNELS 2
+#define ADC_BUF_SIZE 2000 // 1000 сэмплов на канал 
+
+volatile uint16_t adc_buffer[ADC_BUF_SIZE];
+volatile uint8_t flag_half_ready = 0;
+volatile uint8_t flag_full_ready = 0;
+
+volatile uint32_t dwt_timestamp_prev = 0;
+volatile uint32_t dwt_cycles_diff = 0;
+volatile uint32_t missed_blocks = 0;
+
+// Расчет по теореме Найквиста (fs > 100 kHz для корректного захвата гармоник 10 kHz ШИМ)
+constexpr uint32_t THEORETICAL_SAMPLE_RATE = 262500; 
+constexpr uint32_t ALLOWED_ERROR_HZ = 1000;
+
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
+UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_tx;
+
+TIM_HandleTypeDef htim2; // PA5 - SPWM Синус 1 кГц
+TIM_HandleTypeDef htim5; // PA1 - PWM 10 кГц
+DMA_HandleTypeDef hdma_tim2_ch1;
+
+/* Таблица синуса (100 точек) */
+const uint16_t sine_lut[100] = {
+    420, 446, 472, 498, 524, 549, 574, 597, 620, 642, 663, 683, 702, 720, 737, 752, 765, 778, 789, 799,
+    807, 814, 820, 824, 827, 828, 827, 824, 820, 814, 807, 799, 789, 778, 765, 752, 737, 720, 702, 683,
+    663, 642, 620, 597, 574, 549, 524, 498, 472, 446, 420, 394, 368, 342, 316, 291, 266, 243, 220, 198,
+    177, 157, 138, 120, 103,  88,  75,  62,  51,  41,  33,  26,  20,  16,  13,  12,  13,  16,  20,  26,
+     33,  41,  51,  62,  75,  88, 103, 120, 138, 157, 177, 198, 220, 243, 266, 291, 316, 342, 368, 394
+};
+
+/* ==============================================================================
+ * DSP ФИЛЬТРЫ И OVERSAMPLING
+ * ==============================================================================
+ */
+// 1. OVERSAMPLING: Увеличиваем разрядность на 4 бита (до 16-bit). Нужно 4^4 = 256 отсчетов.
+#define OS_N 256
+#define OS_SHIFT 4
+uint16_t os_buf[OS_N] = {0};
+uint16_t os_idx = 0;
+uint32_t os_sum = 0;
+uint16_t last_os_16bit = 0;
+
+// 2. Скользящее среднее (MA)
+#define MA_SIZE 16
+uint16_t ma_buf[MA_SIZE] = {0};
+uint16_t ma_med_buf[MA_SIZE] = {0};
+uint8_t ma_idx = 0;
+uint32_t ma_sum = 0;
+uint32_t ma_med_sum = 0;
+
+// 3. Экспоненциальный фильтр (EMA)
+float ema_val = 0;
+float ema_med_val = 0;
+const float ALPHA = 0.15f;
+
+// 4. Медиана
+uint16_t med_buf[3] = {0};
+uint8_t med_idx = 0;
+
+inline uint16_t get_median3(uint16_t a, uint16_t b, uint16_t c) {
+    if (a > b) { uint16_t t=a; a=b; b=t; }
+    if (b > c) { uint16_t t=b; b=c; c=t; }
+    if (a > b) { uint16_t t=a; a=b; b=t; }
+    return b;
+}
+
+#define BTN_READ() ((GPIOA->IDR & GPIO_PIN_0) == 0)
+volatile bool g_btn_state = false;
+
+#define DWT_CTRL    (*(volatile uint32_t *)0xE0001000)
+#define DWT_CYCCNT  (*(volatile uint32_t *)0xE0001004)
+#define DEMCR       (*(volatile uint32_t *)0xE000EDFC)
+
+void Enable_DWT(void) {
+    DEMCR |= 0x01000000;
+    DWT_CYCCNT = 0;
+    DWT_CTRL |= 1;
+}
+
 extern "C" {
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
-static void MX_TIM1_Init(void);
-static void MX_TIM2_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
-static void MX_TIM5_Init(void);
+static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
-}
-
-inline uint32_t get_absolute_capture(TIM_HandleTypeDef *htim,
-                                     uint32_t channel) {
-  uint32_t overflows = g_tim3_overflows;
-  uint32_t ccr = HAL_TIM_ReadCapturedValue(htim, channel);
-  if (__HAL_TIM_GET_FLAG(htim, TIM_FLAG_UPDATE) != RESET) {
-    if (ccr < 0x8000)
-      overflows++;
-  }
-  return (overflows << 16) | (ccr & 0xFFFF);
+static void MX_TIM2_Init(void);
+static void MX_TIM5_Init(void);
 }
 
 int main(void) {
@@ -118,120 +136,138 @@ int main(void) {
 
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_TIM1_Init();
-  MX_TIM2_Init();
-  MX_TIM3_Init();
-  MX_TIM4_Init();
-  MX_TIM5_Init();
+  MX_ADC1_Init();
   MX_USART1_UART_Init();
+  MX_TIM2_Init();
+  MX_TIM5_Init();
 
-  LED_PC13_OFF();
+  Enable_DWT();
 
-  /* Запускаем ШИМ только на PA1 (Канал 2) */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  /* Запускаем ШИМ 1 кГц Синус на PA5 (через DMA) */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_DMA_Start(&hdma_tim2_ch1, (uint32_t)sine_lut, (uint32_t)&TIM2->CCR1, 100);
+  __HAL_TIM_ENABLE_DMA(&htim2, TIM_DMA_CC1);
 
-  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
-  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
+  /* Запускаем ШИМ 10 кГц на PA1 */
+  HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_2);
 
-  HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
+  /* Запускаем АЦП */
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buffer, ADC_BUF_SIZE);
 
-  __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
-  HAL_TIM_Base_Start(&htim4);
-  HAL_TIM_Base_Start_IT(&htim5);
+  uint32_t debounce_timer = 0;
+  uint32_t telemetry_timer = 0;
+  char json_buf[150];
 
-  BtnState btn_fsm = BtnState::IDLE;
-  uint32_t press_time = 0;
-  uint8_t led_blink_count = 0;
-  uint32_t led_timer = 0;
+  uint16_t last_raw=0, last_med=0, last_ma=0, last_ma_med=0;
 
   while (1) {
-    g_tx_manager.process_timeouts(HAL_GetTick());
+    /* Антидребезг кнопки (1 мс) на PA0 */
+    if (HAL_GetTick() - debounce_timer >= 1) {
+        debounce_timer = HAL_GetTick();
+        static uint16_t btn_hist = 0;
+        btn_hist = (btn_hist << 1) | (BTN_READ() ? 1 : 0);
+        if ((btn_hist & 0x03FF) == 0x03FF) g_btn_state = true;
+        if ((btn_hist & 0x03FF) == 0x0000) g_btn_state = false;
+    }
 
-    /* ==============================================================================
-     * BUTTON FINITE STATE MACHINE (FSM)
-     * ==============================================================================
-     */
-    if (g_btn_event) {
-      g_btn_event = false;
-      if (g_btn_state) { /* Кнопка нажата */
-        g_current_fsm_mode = 0; /* Опускаем график в 0 при контакте */
-        if (btn_fsm == BtnState::IDLE) {
-          btn_fsm = BtnState::PRESSED;
-          press_time = HAL_GetTick();
-        } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
-          btn_fsm = BtnState::IDLE;
-          g_current_fsm_mode = 2; /* [DOUBLE CLICK] */
+    /* Обработка данных АЦП */
+    uint32_t process_start = 0;
+    uint32_t process_end = 0;
+    bool process_now = false;
+
+    if (flag_half_ready) {
+        process_start = 0;
+        process_end = ADC_BUF_SIZE / 2;
+        process_now = true;
+    } else if (flag_full_ready) {
+        process_start = ADC_BUF_SIZE / 2;
+        process_end = ADC_BUF_SIZE;
+        process_now = true;
+    }
+
+    if (process_now) {
+        /* Применяем каскадную фильтрацию к Каналу 3 (Синус) */
+        for (uint32_t i = process_start; i < process_end; i += NUM_ADC_CHANNELS) {
+            last_raw = adc_buffer[i]; 
+
+            // 1. Медиана
+            med_buf[med_idx] = last_raw;
+            med_idx = (med_idx + 1) % 3;
+            last_med = get_median3(med_buf[0], med_buf[1], med_buf[2]);
+
+            // 2. Экспоненциальное сглаживание
+            ema_val = ALPHA * last_raw + (1.0f - ALPHA) * ema_val;
+            ema_med_val = ALPHA * last_med + (1.0f - ALPHA) * ema_med_val;
+
+            // 3. Скользящее среднее
+            ma_sum -= ma_buf[ma_idx];
+            ma_buf[ma_idx] = last_raw;
+            ma_sum += last_raw;
+            last_ma = ma_sum / MA_SIZE;
+
+            // 4. Скользящее среднее + Медиана
+            ma_med_sum -= ma_med_buf[ma_idx];
+            ma_med_buf[ma_idx] = last_med;
+            ma_med_sum += last_med;
+            last_ma_med = ma_med_sum / MA_SIZE;
+
+            ma_idx = (ma_idx + 1) % MA_SIZE;
+
+            // 5. OVERSAMPLING (Увеличение разрядности до 16-бит)
+            os_sum -= os_buf[os_idx];
+            os_buf[os_idx] = last_raw;
+            os_sum += last_raw;
+            last_os_16bit = os_sum >> OS_SHIFT; // Результат от 0 до 65535
+            os_idx = (os_idx + 1) % OS_N;
         }
-      } else { /* Кнопка отпущена */
-        if (btn_fsm == BtnState::PRESSED) {
-          if (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS) {
-            btn_fsm = BtnState::IDLE;
-          } else {
-            btn_fsm = BtnState::WAIT_DOUBLE;
-            press_time = HAL_GetTick();
-          }
+
+        /* ==========================================================
+         * СТРЕСС-ТЕСТ (НАГРУЗКА ПО КНОПКЕ)
+         * ==========================================================
+         * Половина буфера DMA заполняется за ~1.9 мс.
+         * Задержка 5 мс заблокирует CPU, и DMA перезапишет данные.
+         */
+        if (g_btn_state) {
+            HAL_Delay(5); 
         }
-      }
+
+        /* Только после завершения ВСЕХ вычислений (и задержек) сбрасываем флаг */
+        if (process_start == 0) flag_half_ready = 0;
+        else flag_full_ready = 0;
     }
 
-    if (btn_fsm == BtnState::WAIT_DOUBLE &&
-        (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
-      btn_fsm = BtnState::IDLE;
-      g_current_fsm_mode = 1; /* [SHORT CLICK] */
-    }
+    /* Отправка телеметрии (JSON) каждые 50 мс */
+    if (HAL_GetTick() - telemetry_timer >= 50) {
+        telemetry_timer = HAL_GetTick();
 
-    if (btn_fsm == BtnState::PRESSED &&
-        (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
-      btn_fsm = BtnState::IDLE;
-      g_current_fsm_mode = 3; /* [LONG PRESS] */
-    }
-
-    if (led_blink_count > 0) {
-      if (HAL_GetTick() - led_timer > LED_TOGGLE_INTERVAL_MS) {
-        led_timer = HAL_GetTick();
-        if (led_blink_count % 2 == 0)
-          LED_PC13_ON();
-        else
-          LED_PC13_OFF();
-        led_blink_count--;
-      }
-    } else {
-      LED_PC13_OFF();
-    }
-
-    if (__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_UPDATE)) {
-      __HAL_TIM_CLEAR_IT(&htim4, TIM_IT_UPDATE);
-
-      if (g_measured_period_ticks > 0) {
         __disable_irq();
-        uint32_t period = g_measured_period_ticks;
-        uint32_t pulse = g_measured_pulse_ticks;
-        uint32_t isr_duration = g_isr_duration_ticks;
-        uint8_t current_btn_event = g_current_fsm_mode;
+        uint32_t current_missed = missed_blocks;
         __enable_irq();
 
-        PwmMetrics metrics{};
-        metrics.frequency_hz = 16000000 / period;
-        uint32_t duty = (pulse * 100) / period;
-        metrics.duty_cycle_percent =
-            static_cast<uint8_t>(duty > 100 ? 100 : duty);
-        metrics.isr_time_ticks = static_cast<uint16_t>(isr_duration);
-        metrics.btn_event = current_btn_event;
+        // МАШТАБИРОВАНИЕ В ВОЛЬТЫ
+        float v_raw = adc12_to_volts(last_raw);
+        float v_ema = adc12_to_volts((uint16_t)ema_val);
+        float v_os  = adc16_to_volts(last_os_16bit);
 
-        bool sent = g_tx_manager.send_frame_with_ack(
-            static_cast<uint8_t>(protocol::MessageType::DATA), g_msg_seq_num,
-            reinterpret_cast<const uint8_t *>(&metrics), sizeof(metrics),
-            ACK_TIMEOUT_MS, MAX_RETRIES);
+        // Хак для вывода float без флагов линкера (формат X.XXXX Вольт)
+        int raw_i = (int)v_raw; int raw_f = (int)((v_raw - raw_i) * 10000);
+        int ema_i = (int)v_ema; int ema_f = (int)((v_ema - ema_i) * 10000);
+        int os_i  = (int)v_os;  int os_f  = (int)((v_os - os_i) * 10000);
 
-        if (sent)
-          g_msg_seq_num++;
-      }
+        /* Формируем JSON (с Вольтами, оверсэмплингом и счетчиком ошибок) */
+        snprintf(json_buf, sizeof(json_buf), 
+                 "{\"raw_v\":%d.%04d,\"ema_v\":%d.%04d,\"os_v\":%d.%04d,\"btn\":%d,\"miss\":%lu}\n",
+                 raw_i, raw_f, ema_i, ema_f, os_i, os_f, g_btn_state, current_missed);
+
+        HAL_UART_Transmit(&huart1, (uint8_t*)json_buf, strlen(json_buf), 10);
     }
   }
 }
 
+/* ==============================================================================
+ * ИНИЦИАЛИЗАЦИЯ ПЕРИФЕРИИ (Из предыдущих настроек)
+ * ==============================================================================
+ */
 void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
@@ -242,132 +278,70 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-    Error_Handler();
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
 
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
                                 RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
-    Error_Handler();
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
 }
 
 static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
 
-  GPIO_InitStruct.Pin = GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
+  // PA0 - Кнопка
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-}
 
-static void MX_DMA_Init(void) {
-  __HAL_RCC_DMA1_CLK_ENABLE();
-  __HAL_RCC_DMA2_CLK_ENABLE();
-  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
-  HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
-}
-
-static void MX_TIM1_Init(void) {
-  TIM_IC_InitTypeDef sConfigIC = {0};
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_TIM1_CLK_ENABLE();
-
-  GPIO_InitStruct.Pin = GPIO_PIN_8;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  // PA2, PA3 - Входы АЦП (Loopback)
+  GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 65535;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-    Error_Handler();
-  if (HAL_TIM_IC_Init(&htim1) != HAL_OK)
-    Error_Handler();
-
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
-    Error_Handler();
-
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
-    Error_Handler();
-
-  HAL_NVIC_SetPriority(TIM1_CC_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
+  // PA1 - TIM5 CH2, PA5 - TIM2 CH1
+  GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM5;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 static void MX_TIM2_Init(void) {
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_TIM2_CLK_ENABLE();
 
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
+  htim2.Init.Prescaler = 0; 
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 1599;
+  htim2.Init.Period = 840 - 1; 
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  HAL_TIM_Base_Init(&htim2);
-
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig);
   HAL_TIM_PWM_Init(&htim2);
-
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig);
 
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-
-  /* Генерируем ШИМ только на Канале 2 (PA1) */
-  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
-
-  /* Настраиваем как выход ШИМ только пин PA1 (оставляя PA0
-   * свободной кнопкой) */
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1);
 
   hdma_tim2_ch1.Instance = DMA1_Stream5;
   hdma_tim2_ch1.Init.Channel = DMA_CHANNEL_3;
@@ -378,90 +352,75 @@ static void MX_TIM2_Init(void) {
   hdma_tim2_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
   hdma_tim2_ch1.Init.Mode = DMA_CIRCULAR;
   hdma_tim2_ch1.Init.Priority = DMA_PRIORITY_LOW;
-  hdma_tim2_ch1.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
   HAL_DMA_Init(&hdma_tim2_ch1);
-
   __HAL_LINKDMA(&htim2, hdma[TIM_DMA_ID_CC1], hdma_tim2_ch1);
 }
 
-static void MX_TIM3_Init(void) {
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_IC_InitTypeDef sConfigIC = {0};
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_TIM3_CLK_ENABLE();
-
-  GPIO_InitStruct.Pin = GPIO_PIN_6;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 65535;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
-    Error_Handler();
-
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig);
-  if (HAL_TIM_IC_Init(&htim3) != HAL_OK)
-    Error_Handler();
-
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
-    Error_Handler();
-
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
-  if (HAL_TIM_IC_ConfigChannel(&htim3, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
-    Error_Handler();
-
-  HAL_NVIC_SetPriority(TIM3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(TIM3_IRQn);
-}
-
-static void MX_TIM4_Init(void) {
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  __HAL_RCC_TIM4_CLK_ENABLE();
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 1600 - 1;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 200 - 1;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
-    Error_Handler();
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig);
-}
-
 static void MX_TIM5_Init(void) {
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
   __HAL_RCC_TIM5_CLK_ENABLE();
-  htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 16 - 1;
-  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 1000 - 1;
-  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
-    Error_Handler();
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig);
 
-  HAL_NVIC_SetPriority(TIM5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(TIM5_IRQn);
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 0; 
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 8400 - 1; 
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  HAL_TIM_PWM_Init(&htim5);
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 6300; 
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2); 
+}
+
+static void MX_ADC1_Init(void) {
+  ADC_ChannelConfTypeDef sConfig = {0};
+  __HAL_RCC_ADC1_CLK_ENABLE();
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4; 
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B; 
+  hadc1.Init.ScanConvMode = ENABLE;                
+  hadc1.Init.ContinuousConvMode = ENABLE;          
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 2;                  
+  hadc1.Init.DMAContinuousRequests = ENABLE;       
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  HAL_ADC_Init(&hadc1);
+
+  sConfig.Channel = ADC_CHANNEL_3; 
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_28CYCLES;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  sConfig.Channel = ADC_CHANNEL_2; 
+  sConfig.Rank = 2;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  hdma_adc1.Instance = DMA2_Stream0;
+  hdma_adc1.Init.Channel = DMA_CHANNEL_0;
+  hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+  hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;
+  hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;
+  hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+  hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
+  hdma_adc1.Init.Mode = DMA_CIRCULAR;
+  hdma_adc1.Init.Priority = DMA_PRIORITY_HIGH;
+  HAL_DMA_Init(&hdma_adc1);
+  __HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
+}
+
+static void MX_DMA_Init(void) {
+  __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
 }
 
 static void MX_USART1_UART_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   __HAL_RCC_USART1_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
+  
   GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -477,119 +436,239 @@ static void MX_USART1_UART_Init(void) {
   huart1.Init.Mode = UART_MODE_TX_RX;
   huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-    Error_Handler();
-
-  hdma_usart1_tx.Instance = DMA2_Stream7;
-  hdma_usart1_tx.Init.Channel = DMA_CHANNEL_4;
-  hdma_usart1_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
-  hdma_usart1_tx.Init.PeriphInc = DMA_PINC_DISABLE;
-  hdma_usart1_tx.Init.MemInc = DMA_MINC_ENABLE;
-  hdma_usart1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
-  hdma_usart1_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
-  hdma_usart1_tx.Init.Mode = DMA_NORMAL;
-  hdma_usart1_tx.Init.Priority = DMA_PRIORITY_LOW;
-  hdma_usart1_tx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
-  if (HAL_DMA_Init(&hdma_usart1_tx) != HAL_OK)
-    Error_Handler();
-
-  __HAL_LINKDMA(&huart1, hdmatx, hdma_usart1_tx);
-  HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(USART1_IRQn);
+  HAL_UART_Init(&huart1);
 }
 
 extern "C" {
-void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
-void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }
+void DMA2_Stream0_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_adc1); }
 
-void USART1_IRQHandler(void) {
-  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET)
-    __HAL_UART_CLEAR_OREFLAG(&huart1);
-  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_NE) != RESET)
-    __HAL_UART_CLEAR_NEFLAG(&huart1);
-  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_FE) != RESET)
-    __HAL_UART_CLEAR_FEFLAG(&huart1);
-  HAL_UART_IRQHandler(&huart1);
-}
-
-void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
-void TIM1_CC_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }
-
-void TIM5_IRQHandler(void) {
-  DEBUG_PIN_HIGH();
-
-  if (__HAL_TIM_GET_FLAG(&htim5, TIM_FLAG_UPDATE)) {
-    __HAL_TIM_CLEAR_IT(&htim5, TIM_IT_UPDATE);
-
-    static uint32_t sine_timer = 0;
-    static uint16_t sine_index = 0;
-    if (++sine_timer >= 50) {
-      sine_timer = 0;
-      /* Обновляем только PA1 (Канал 2) */
-      TIM2->CCR2 = sine_lut[sine_index];
-      sine_index = (sine_index + 1) % SINE_SAMPLES;
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        if (flag_half_ready == 1) missed_blocks++; 
+        flag_half_ready = 1;
     }
+}
 
-    static uint16_t history = 0x0000;
-    history = (history << 1) | (BTN_READ() ? 1 : 0);
-    bool new_state = g_btn_state;
-    if ((history & 0x03FF) == 0x03FF)
-      new_state = true;
-    if ((history & 0x03FF) == 0x0000)
-      new_state = false;
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        uint32_t current_dwt = DWT_CYCCNT;
+        dwt_cycles_diff = current_dwt - dwt_timestamp_prev;
+        dwt_timestamp_prev = current_dwt;
 
-    if (new_state != g_btn_state) {
-      g_btn_state = new_state;
-      g_btn_event = true;
+        if (flag_full_ready == 1) missed_blocks++; 
+        flag_full_ready = 1;
     }
-  }
-  DEBUG_PIN_LOW();
 }
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM3) {
-    g_tim3_overflows = g_tim3_overflows + 1;
-  }
-}
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-  if (huart->Instance == USART1) {
-    g_tx_manager.on_tx_complete_isr();
-  }
-}
-
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM3) {
-    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-      uint32_t t_rising_curr = get_absolute_capture(htim, TIM_CHANNEL_1);
-      if (g_has_first_rising) {
-        g_measured_period_ticks = t_rising_curr - g_t_rising_prev;
-      }
-      g_t_rising_prev = t_rising_curr;
-      g_has_first_rising = true;
-    } else if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-      if (g_has_first_rising) {
-        uint32_t t_falling = get_absolute_capture(htim, TIM_CHANNEL_2);
-        g_measured_pulse_ticks = t_falling - g_t_rising_prev;
-      }
-    }
-  }
-
-  if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
-    uint32_t start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
-    uint32_t end = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-    g_isr_duration_ticks =
-        (end >= start) ? (end - start) : ((0xFFFF - start) + end + 1);
-  }
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc->ErrorCode & HAL_ADC_ERROR_OVR) missed_blocks++;
 }
 
 void Error_Handler(void) {
   __disable_irq();
-  while (1) {
-  }
+  while (1) {}
+}
 }
 
-#ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line) {}
-#endif
+void SystemClock_Config(void) {
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 16;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+}
+
+static void MX_GPIO_Init(void) {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  // PA0 - Кнопка
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  // PA2, PA3 - Входы АЦП (Loopback)
+  GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  // PA1 - TIM5 CH2, PA5 - TIM2 CH1
+  GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_5;
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM5;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+}
+
+static void MX_TIM2_Init(void) {
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  __HAL_RCC_TIM2_CLK_ENABLE();
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0; 
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 840 - 1; // 84 MHz / 840 = 100 kHz Update
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  HAL_TIM_PWM_Init(&htim2);
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1); // PA5
+
+  hdma_tim2_ch1.Instance = DMA1_Stream5;
+  hdma_tim2_ch1.Init.Channel = DMA_CHANNEL_3;
+  hdma_tim2_ch1.Init.Direction = DMA_MEMORY_TO_PERIPH;
+  hdma_tim2_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
+  hdma_tim2_ch1.Init.MemInc = DMA_MINC_ENABLE;
+  hdma_tim2_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+  hdma_tim2_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
+  hdma_tim2_ch1.Init.Mode = DMA_CIRCULAR;
+  hdma_tim2_ch1.Init.Priority = DMA_PRIORITY_LOW;
+  HAL_DMA_Init(&hdma_tim2_ch1);
+  __HAL_LINKDMA(&htim2, hdma[TIM_DMA_ID_CC1], hdma_tim2_ch1);
+}
+
+static void MX_TIM5_Init(void) {
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  __HAL_RCC_TIM5_CLK_ENABLE();
+
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 0; 
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 8400 - 1; // 84 MHz / 8400 = 10 kHz
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  HAL_TIM_PWM_Init(&htim5);
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 6300; // Duty 3/4 = 75%
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2); // PA1
+}
+
+static void MX_ADC1_Init(void) {
+  ADC_ChannelConfTypeDef sConfig = {0};
+  __HAL_RCC_ADC1_CLK_ENABLE();
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4; // 21 MHz
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B; 
+  hadc1.Init.ScanConvMode = ENABLE;                
+  hadc1.Init.ContinuousConvMode = ENABLE;          
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 2;                  
+  hadc1.Init.DMAContinuousRequests = ENABLE;       
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+  HAL_ADC_Init(&hadc1);
+
+  // Настройка выборки 28 циклов. Итого 40 циклов на канал.
+  sConfig.Channel = ADC_CHANNEL_3; // PA3 (читает синус с PA5)
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_28CYCLES;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  sConfig.Channel = ADC_CHANNEL_2; // PA2 (читает ШИМ с PA1)
+  sConfig.Rank = 2;
+  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+  hdma_adc1.Instance = DMA2_Stream0;
+  hdma_adc1.Init.Channel = DMA_CHANNEL_0;
+  hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;
+  hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;
+  hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;
+  hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+  hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
+  hdma_adc1.Init.Mode = DMA_CIRCULAR;
+  hdma_adc1.Init.Priority = DMA_PRIORITY_HIGH;
+  HAL_DMA_Init(&hdma_adc1);
+  __HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
+}
+
+static void MX_DMA_Init(void) {
+  __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+}
+
+static void MX_USART1_UART_Init(void) {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  __HAL_RCC_USART1_CLK_ENABLE();
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  HAL_UART_Init(&huart1);
+}
+
+extern "C" {
+void DMA2_Stream0_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_adc1); }
+
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        if (flag_half_ready == 1) missed_blocks++; 
+        flag_half_ready = 1;
+    }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+        uint32_t current_dwt = DWT_CYCCNT;
+        dwt_cycles_diff = current_dwt - dwt_timestamp_prev;
+        dwt_timestamp_prev = current_dwt;
+
+        if (flag_full_ready == 1) missed_blocks++; 
+        flag_full_ready = 1;
+    }
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc->ErrorCode & HAL_ADC_ERROR_OVR) missed_blocks++;
+}
+
+void Error_Handler(void) {
+  __disable_irq();
+  while (1) {}
+}
 }
