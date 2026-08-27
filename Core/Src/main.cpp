@@ -208,12 +208,12 @@ int main(void) {
     if (led_blink_count > 0) {
       if (HAL_GetTick() - led_timer > LED_TOGGLE_INTERVAL_MS) {
         led_timer = HAL_GetTick();
-        static bool led_state = false;
-        led_state = !led_state;
-        if (led_state)
+        if (led_blink_count % 2 == 0) {
           LED_PC13_ON();
-        else
+        } else {
           LED_PC13_OFF();
+        }
+
         led_blink_count--;
       }
     } else {
