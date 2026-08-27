@@ -72,8 +72,7 @@ target_compile_options(${PROJECT_NAME}.elf PRIVATE
 target_link_options(${PROJECT_NAME}.elf PRIVATE
     ${CPU_OPTIONS}
     -specs=nano.specs
-    -specs=nosys.specs  # Добавлено для корректной работы системных вызовов
-    -u _printf_float    # ВАЖНО: Включает поддержку %f в printf/snprintf для float!
+    -u _printf_float    # Включает поддержку %f в printf/snprintf для float
     -T${CMAKE_CURRENT_SOURCE_DIR}/STM32F411CEUX_FLASH.ld
     -Wl,-Map=${PROJECT_NAME}.map,--cref
     -Wl,--gc-sections
