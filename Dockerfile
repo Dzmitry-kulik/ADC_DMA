@@ -9,4 +9,4 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 
 # Копирование итогового артефакта
 FROM scratch AS artifacts
-COPY --from=builder /app/build/PMW_CONFIG.elf /
+COPY --from=builder /app/build/ADC_DMA.elf /
