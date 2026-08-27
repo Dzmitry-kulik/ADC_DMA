@@ -46,8 +46,7 @@ const uint16_t sine_lut[SINE_SAMPLES] = {
  * ATOMIC PIN OPERATIONS VIA BSRR / IDR (1 cycle)
  * ==============================================================================
  */
-/* ИСПРАВЛЕНО: Читаем встроенную кнопку WeAct на PA0 (Active High) */
-#define BTN_READ() ((GPIOA->IDR & GPIO_PIN_0) != 0)
+#define BTN_READ() ((GPIOA->IDR & GPIO_PIN_0) == 0) /* true if pressed (0) */
 #define DEBUG_PIN_HIGH() (GPIOB->BSRR = GPIO_PIN_1) /* PB1 High (ISR Start) */
 #define DEBUG_PIN_LOW()                                                        \
   (GPIOB->BSRR = (GPIO_PIN_1 << 16)) /* PB1 Low (ISR End) */
@@ -279,10 +278,9 @@ static void MX_GPIO_Init(void) {
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* ИСПРАВЛЕНО: Кнопка на PA0 (WeAct Black Pill) */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
