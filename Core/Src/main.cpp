@@ -11,16 +11,18 @@
 #include <stdio.h>
 #include <string.h>
 
+/* ==============================================================================
+ * КОНФИГ КАЛИБРОВКИ (ИНЖЕНЕРНЫЕ ЕДИНИЦЫ)
+ * ==============================================================================
+ */
 struct CalibrationConfig {
     float v_ref;        // Опорное напряжение АЦП (Вольты)
     float offset;       // Смещение нуля (Вольты)
     float gain;         // Коэффициент усиления (делитель напряжения)
 };
 
-// Конфиг: АЦП запитан от 3.3В, без смещения, читаем напрямую 1:1
 const CalibrationConfig sensor_cfg = {3.3f, 0.0f, 1.0f};
 
-/* Функции перевода попугаев АЦП в Вольты */
 float adc12_to_volts(uint16_t raw_12bit) {
     return ((float)raw_12bit / 4095.0f) * sensor_cfg.v_ref * sensor_cfg.gain + sensor_cfg.offset;
 }
@@ -44,7 +46,6 @@ volatile uint32_t dwt_timestamp_prev = 0;
 volatile uint32_t dwt_cycles_diff = 0;
 volatile uint32_t missed_blocks = 0;
 
-// Расчет по теореме Найквиста (fs > 100 kHz для корректного захвата гармоник 10 kHz ШИМ)
 constexpr uint32_t THEORETICAL_SAMPLE_RATE = 262500; 
 constexpr uint32_t ALLOWED_ERROR_HZ = 1000;
 
@@ -71,7 +72,6 @@ const uint16_t sine_lut[100] = {
  * DSP ФИЛЬТРЫ И OVERSAMPLING
  * ==============================================================================
  */
-// 1. OVERSAMPLING: Увеличиваем разрядность на 4 бита (до 16-bit). Нужно 4^4 = 256 отсчетов.
 #define OS_N 256
 #define OS_SHIFT 4
 uint16_t os_buf[OS_N] = {0};
@@ -79,7 +79,6 @@ uint16_t os_idx = 0;
 uint32_t os_sum = 0;
 uint16_t last_os_16bit = 0;
 
-// 2. Скользящее среднее (MA)
 #define MA_SIZE 16
 uint16_t ma_buf[MA_SIZE] = {0};
 uint16_t ma_med_buf[MA_SIZE] = {0};
@@ -87,12 +86,10 @@ uint8_t ma_idx = 0;
 uint32_t ma_sum = 0;
 uint32_t ma_med_sum = 0;
 
-// 3. Экспоненциальный фильтр (EMA)
 float ema_val = 0;
 float ema_med_val = 0;
 const float ALPHA = 0.15f;
 
-// 4. Медиана
 uint16_t med_buf[3] = {0};
 uint8_t med_idx = 0;
 
@@ -124,6 +121,7 @@ static void MX_ADC1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM5_Init(void);
+void Error_Handler(void);
 }
 
 int main(void) {
@@ -182,7 +180,6 @@ int main(void) {
     }
 
     if (process_now) {
-        /* Применяем каскадную фильтрацию к Каналу 3 (Синус) */
         for (uint32_t i = process_start; i < process_end; i += NUM_ADC_CHANNELS) {
             last_raw = adc_buffer[i]; 
 
@@ -213,21 +210,15 @@ int main(void) {
             os_sum -= os_buf[os_idx];
             os_buf[os_idx] = last_raw;
             os_sum += last_raw;
-            last_os_16bit = os_sum >> OS_SHIFT; // Результат от 0 до 65535
+            last_os_16bit = os_sum >> OS_SHIFT; 
             os_idx = (os_idx + 1) % OS_N;
         }
 
-        /* ==========================================================
-         * СТРЕСС-ТЕСТ (НАГРУЗКА ПО КНОПКЕ)
-         * ==========================================================
-         * Половина буфера DMA заполняется за ~1.9 мс.
-         * Задержка 5 мс заблокирует CPU, и DMA перезапишет данные.
-         */
+        /* ТЕСТ НА ПЕРЕГРУЗКУ */
         if (g_btn_state) {
             HAL_Delay(5); 
         }
 
-        /* Только после завершения ВСЕХ вычислений (и задержек) сбрасываем флаг */
         if (process_start == 0) flag_half_ready = 0;
         else flag_full_ready = 0;
     }
@@ -240,17 +231,14 @@ int main(void) {
         uint32_t current_missed = missed_blocks;
         __enable_irq();
 
-        // МАШТАБИРОВАНИЕ В ВОЛЬТЫ
         float v_raw = adc12_to_volts(last_raw);
         float v_ema = adc12_to_volts((uint16_t)ema_val);
         float v_os  = adc16_to_volts(last_os_16bit);
 
-        // Хак для вывода float без флагов линкера (формат X.XXXX Вольт)
         int raw_i = (int)v_raw; int raw_f = (int)((v_raw - raw_i) * 10000);
         int ema_i = (int)v_ema; int ema_f = (int)((v_ema - ema_i) * 10000);
         int os_i  = (int)v_os;  int os_f  = (int)((v_os - os_i) * 10000);
 
-        /* Формируем JSON (с Вольтами, оверсэмплингом и счетчиком ошибок) */
         snprintf(json_buf, sizeof(json_buf), 
                  "{\"raw_v\":%d.%04d,\"ema_v\":%d.%04d,\"os_v\":%d.%04d,\"btn\":%d,\"miss\":%lu}\n",
                  raw_i, raw_f, ema_i, ema_f, os_i, os_f, g_btn_state, current_missed);
@@ -261,7 +249,7 @@ int main(void) {
 }
 
 /* ==============================================================================
- * ИНИЦИАЛИЗАЦИЯ ПЕРИФЕРИИ (Из предыдущих настроек)
+ * ИНИЦИАЛИЗАЦИЯ ПЕРИФЕРИИ
  * ==============================================================================
  */
 void SystemClock_Config(void) {
@@ -296,19 +284,16 @@ static void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  // PA0 - Кнопка
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  // PA2, PA3 - Входы АЦП (Loopback)
   GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  // PA1 - TIM5 CH2, PA5 - TIM2 CH1
   GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -435,12 +420,16 @@ static void MX_USART1_UART_Init(void) {
   HAL_UART_Init(&huart1);
 }
 
+/* ==============================================================================
+ * ПРЕРЫВАНИЯ И КОЛЛБЭКИ
+ * ==============================================================================
+ */
 extern "C" {
 void DMA2_Stream0_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_adc1); }
 
 void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
     if (hadc->Instance == ADC1) {
-        if (flag_half_ready == 1) missed_blocks++; 
+        if (flag_half_ready == 1) missed_blocks = missed_blocks + 1; 
         flag_half_ready = 1;
     }
 }
@@ -451,216 +440,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
         dwt_cycles_diff = current_dwt - dwt_timestamp_prev;
         dwt_timestamp_prev = current_dwt;
 
-        if (flag_full_ready == 1) missed_blocks++; 
+        if (flag_full_ready == 1) missed_blocks = missed_blocks + 1; 
         flag_full_ready = 1;
     }
 }
 
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
-    if (hadc->ErrorCode & HAL_ADC_ERROR_OVR) missed_blocks++;
-}
-
-void Error_Handler(void) {
-  __disable_irq();
-  while (1) {}
-}
-}
-
-void SystemClock_Config(void) {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
-
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
-}
-
-static void MX_GPIO_Init(void) {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  // PA0 - Кнопка
-  GPIO_InitStruct.Pin = GPIO_PIN_0;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  // PA2, PA3 - Входы АЦП (Loopback)
-  GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  // PA1 - TIM5 CH2, PA5 - TIM2 CH1
-  GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  
-  GPIO_InitStruct.Pin = GPIO_PIN_5;
-  GPIO_InitStruct.Alternate = GPIO_AF1_TIM2;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-  
-  GPIO_InitStruct.Pin = GPIO_PIN_1;
-  GPIO_InitStruct.Alternate = GPIO_AF2_TIM5;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-}
-
-static void MX_TIM2_Init(void) {
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  __HAL_RCC_TIM2_CLK_ENABLE();
-
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0; 
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 840 - 1; // 84 MHz / 840 = 100 kHz Update
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  HAL_TIM_PWM_Init(&htim2);
-
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1); // PA5
-
-  hdma_tim2_ch1.Instance = DMA1_Stream5;
-  hdma_tim2_ch1.Init.Channel = DMA_CHANNEL_3;
-  hdma_tim2_ch1.Init.Direction = DMA_MEMORY_TO_PERIPH;
-  hdma_tim2_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
-  hdma_tim2_ch1.Init.MemInc = DMA_MINC_ENABLE;
-  hdma_tim2_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
-  hdma_tim2_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
-  hdma_tim2_ch1.Init.Mode = DMA_CIRCULAR;
-  hdma_tim2_ch1.Init.Priority = DMA_PRIORITY_LOW;
-  HAL_DMA_Init(&hdma_tim2_ch1);
-  __HAL_LINKDMA(&htim2, hdma[TIM_DMA_ID_CC1], hdma_tim2_ch1);
-}
-
-static void MX_TIM5_Init(void) {
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  __HAL_RCC_TIM5_CLK_ENABLE();
-
-  htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 0; 
-  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 8400 - 1; // 84 MHz / 8400 = 10 kHz
-  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  HAL_TIM_PWM_Init(&htim5);
-
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 6300; // Duty 3/4 = 75%
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  HAL_TIM_PWM_ConfigChannel(&htim5, &sConfigOC, TIM_CHANNEL_2); // PA1
-}
-
-static void MX_ADC1_Init(void) {
-  ADC_ChannelConfTypeDef sConfig = {0};
-  __HAL_RCC_ADC1_CLK_ENABLE();
-
-  hadc1.Instance = ADC1;
-  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4; // 21 MHz
-  hadc1.Init.Resolution = ADC_RESOLUTION_12B; 
-  hadc1.Init.ScanConvMode = ENABLE;                
-  hadc1.Init.ContinuousConvMode = ENABLE;          
-  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 2;                  
-  hadc1.Init.DMAContinuousRequests = ENABLE;       
-  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
-  HAL_ADC_Init(&hadc1);
-
-  // Настройка выборки 28 циклов. Итого 40 циклов на канал.
-  sConfig.Channel = ADC_CHANNEL_3; // PA3 (читает синус с PA5)
-  sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_28CYCLES;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-
-  sConfig.Channel = ADC_CHANNEL_2; // PA2 (читает ШИМ с PA1)
-  sConfig.Rank = 2;
-  HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-
-  hdma_adc1.Instance = DMA2_Stream0;
-  hdma_adc1.Init.Channel = DMA_CHANNEL_0;
-  hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;
-  hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;
-  hdma_adc1.Init.MemInc = DMA_MINC_ENABLE;
-  hdma_adc1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
-  hdma_adc1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
-  hdma_adc1.Init.Mode = DMA_CIRCULAR;
-  hdma_adc1.Init.Priority = DMA_PRIORITY_HIGH;
-  HAL_DMA_Init(&hdma_adc1);
-  __HAL_LINKDMA(&hadc1, DMA_Handle, hdma_adc1);
-}
-
-static void MX_DMA_Init(void) {
-  __HAL_RCC_DMA1_CLK_ENABLE();
-  __HAL_RCC_DMA2_CLK_ENABLE();
-  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
-}
-
-static void MX_USART1_UART_Init(void) {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_USART1_CLK_ENABLE();
-  
-  GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  HAL_UART_Init(&huart1);
-}
-
-extern "C" {
-void DMA2_Stream0_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_adc1); }
-
-void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {
-    if (hadc->Instance == ADC1) {
-        if (flag_half_ready == 1) missed_blocks++; 
-        flag_half_ready = 1;
-    }
-}
-
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
-    if (hadc->Instance == ADC1) {
-        uint32_t current_dwt = DWT_CYCCNT;
-        dwt_cycles_diff = current_dwt - dwt_timestamp_prev;
-        dwt_timestamp_prev = current_dwt;
-
-        if (flag_full_ready == 1) missed_blocks++; 
-        flag_full_ready = 1;
-    }
-}
-
-void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc) {
-    if (hadc->ErrorCode & HAL_ADC_ERROR_OVR) missed_blocks++;
+    if (hadc->ErrorCode & HAL_ADC_ERROR_OVR) missed_blocks = missed_blocks + 1;
 }
 
 void Error_Handler(void) {
