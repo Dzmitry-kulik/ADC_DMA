@@ -1,15 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
-
 project(PMW_CONFIG C CXX ASM)
-
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# ==============================================================================
-# СБОРКА ПРОШИВКИ ДЛЯ STM32F411CEU6 (ARM Cortex-M4)
-# ==============================================================================
-
 # Опции архитектуры ядра
 set(CPU_OPTIONS
     -mcpu=cortex-m4
