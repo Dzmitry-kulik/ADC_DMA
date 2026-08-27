@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
 project(PMW_CONFIG C CXX ASM)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # Опции архитектуры ядра
 set(CPU_OPTIONS
     -mcpu=cortex-m4
@@ -14,7 +16,7 @@ set(CPU_OPTIONS
 # Объявляем исполняемый файл прошивки
 add_executable(${PROJECT_NAME}.elf)
 
-# Автоматический поиск исходников библиотеки HAL
+# Автоматический поиск исходников библиотеки HAL (подхватит ADC, когда вы его скачаете)
 file(GLOB HAL_SOURCES CONFIGURE_DEPENDS "Drivers/STM32F4xx_HAL_Driver/Src/*.c")
 
 # Исходные файлы проекта
@@ -70,6 +72,8 @@ target_compile_options(${PROJECT_NAME}.elf PRIVATE
 target_link_options(${PROJECT_NAME}.elf PRIVATE
     ${CPU_OPTIONS}
     -specs=nano.specs
+    -specs=nosys.specs  # Добавлено для корректной работы системных вызовов
+    -u _printf_float    # ВАЖНО: Включает поддержку %f в printf/snprintf для float!
     -T${CMAKE_CURRENT_SOURCE_DIR}/STM32F411CEUX_FLASH.ld
     -Wl,-Map=${PROJECT_NAME}.map,--cref
     -Wl,--gc-sections
