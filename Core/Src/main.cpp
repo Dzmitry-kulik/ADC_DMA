@@ -84,8 +84,6 @@ static uint8_t g_msg_seq_num = 0;
 /* Timing and protocol constants */
 constexpr uint32_t ACK_TIMEOUT_MS = 200;
 constexpr uint8_t MAX_RETRIES = 3;
-/* MODIFIED: Increased interval from 300ms/20000ms to 750ms for clearly visible
- * toggling */
 constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 750; /* LED toggle interval (ms) */
 constexpr uint32_t SHORT_PRESS_TIMEOUT_MS =
     300; /* Double-click wait window (ms) */
@@ -161,7 +159,7 @@ int main(void) {
     g_tx_manager.process_timeouts(HAL_GetTick());
 
     /* ==============================================================================
-     * BUTTON FINITE STATE MACHINE (FSM)
+     * BUTTON FINITE STATE MACHINE (FSM) WITH PWM FREQUENCY VISUALIZATION
      * ==============================================================================
      */
     if (g_btn_event) {
@@ -172,8 +170,9 @@ int main(void) {
           press_time = HAL_GetTick();
         } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
           btn_fsm = BtnState::IDLE;
-          /* MODIFIED: Double click -> 4 toggles (2 on, 2 off) */
-          led_blink_count = 4;
+
+          /* [DOUBLE CLICK] -> Reset to 10 kHz */
+          TIM2->ARR = 1599;
         }
       } else { /* Released */
         if (btn_fsm == BtnState::PRESSED) {
@@ -190,19 +189,22 @@ int main(void) {
     if (btn_fsm == BtnState::WAIT_DOUBLE &&
         (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
       btn_fsm = BtnState::IDLE;
-      /* MODIFIED: Short click -> 2 toggles (1 on, 1 off) */
-      led_blink_count = 2;
+
+      /* [SHORT CLICK] -> Drop frequency to ~5 kHz */
+      TIM2->ARR = 3199;
     }
 
     if (btn_fsm == BtnState::PRESSED &&
         (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
       btn_fsm = BtnState::IDLE;
-      /* MODIFIED: Long press -> 10 toggles (5 on, 5 off) */
-      led_blink_count = 10;
+
+      /* [LONG PRESS] -> Increase frequency to ~20 kHz */
+      TIM2->ARR = 799;
     }
 
     /* ==============================================================================
-     * ASYNCHRONOUS LED INDICATOR
+     * ASYNCHRONOUS LED INDICATOR (Left intact to prevent unused variable
+     * warnings)
      * ==============================================================================
      */
     if (led_blink_count > 0) {
@@ -213,7 +215,6 @@ int main(void) {
         } else {
           LED_PC13_OFF();
         }
-
         led_blink_count--;
       }
     } else {
