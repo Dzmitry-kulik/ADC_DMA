@@ -20,7 +20,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim1; /* ISR duration measurement on PA8 */
-TIM_HandleTypeDef htim2; /* 10 kHz PWM on PA0 and PA1 */
+TIM_HandleTypeDef htim2; /* 10 kHz PWM on PA1 (WeAct Config) */
 TIM_HandleTypeDef htim3; /* PWM Input Capture on PA6 */
 TIM_HandleTypeDef htim4; /* High-frequency telemetry timer (50 Hz) */
 TIM_HandleTypeDef htim5; /* Debounce & sine stepping timer (1 ms) */
@@ -46,7 +46,8 @@ const uint16_t sine_lut[SINE_SAMPLES] = {
  * ATOMIC PIN OPERATIONS VIA BSRR / IDR (1 cycle)
  * ==============================================================================
  */
-#define BTN_READ() ((GPIOB->IDR & GPIO_PIN_0) == 0) /* true if pressed (0) */
+/* ИСПРАВЛЕНО: Читаем встроенную кнопку WeAct на PA0 (Active High) */
+#define BTN_READ() ((GPIOA->IDR & GPIO_PIN_0) != 0)
 #define DEBUG_PIN_HIGH() (GPIOB->BSRR = GPIO_PIN_1) /* PB1 High (ISR Start) */
 #define DEBUG_PIN_LOW()                                                        \
   (GPIOB->BSRR = (GPIO_PIN_1 << 16)) /* PB1 Low (ISR End) */
@@ -63,19 +64,14 @@ volatile uint32_t g_measured_period_ticks = 0;
 volatile uint32_t g_measured_pulse_ticks = 0;
 volatile bool g_has_first_rising = false;
 
-/* Global variable to store ISR execution duration (in 16 MHz ticks = 62.5 ns)
- */
 volatile uint32_t g_isr_duration_ticks = 0;
 
 volatile bool g_btn_event = false;
 volatile bool g_btn_state = false;
 enum class BtnState { IDLE, PRESSED, WAIT_DOUBLE };
 
-/* ДОБАВЛЕНО: Текущий режим для передачи на график (0=None, 1=Short, 2=Double,
- * 3=Long) */
 volatile uint8_t g_current_fsm_mode = 0;
 
-/* ИЗМЕНЕНО: Структура теперь весит ровно 8 байт */
 struct __attribute__((packed)) PwmMetrics {
   uint32_t frequency_hz;
   uint8_t duty_cycle_percent;
@@ -87,14 +83,11 @@ protocol::DiagnosticsStats g_stats{};
 protocol::UartTxManager g_tx_manager(huart1);
 static uint8_t g_msg_seq_num = 0;
 
-/* Timing and protocol constants */
 constexpr uint32_t ACK_TIMEOUT_MS = 200;
 constexpr uint8_t MAX_RETRIES = 3;
-constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 750; /* LED toggle interval (ms) */
-constexpr uint32_t SHORT_PRESS_TIMEOUT_MS =
-    300; /* Double-click wait window (ms) */
-constexpr uint32_t LONG_PRESS_THRESHOLD_MS =
-    1000; /* Long press threshold (ms) */
+constexpr uint32_t LED_TOGGLE_INTERVAL_MS = 750;
+constexpr uint32_t SHORT_PRESS_TIMEOUT_MS = 300;
+constexpr uint32_t LONG_PRESS_THRESHOLD_MS = 1000;
 
 /* Private function prototypes -----------------------------------------------*/
 extern "C" {
@@ -135,29 +128,22 @@ int main(void) {
 
   LED_PC13_OFF();
 
-  /* 1. Start standard PWM output (sine duty cycle is updated in TIM5 ISR) */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  /* ИСПРАВЛЕНО: Запускаем ШИМ только на PA1 (Канал 2) */
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
-  /* 2. Start PWM period capture (TIM3) */
-  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2);
+  __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
 
-  /* 3. Start ISR execution time measurement (TIM1) */
   HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_1);
   HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_2);
 
-  /* 4. Configure telemetry timer (TIM4 - 50 Hz / 20 ms interval) */
   __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
   HAL_TIM_Base_Start(&htim4);
-
-  /* 5. Start debounce and sine step timer (TIM5 - 1 ms) */
   HAL_TIM_Base_Start_IT(&htim5);
 
   BtnState btn_fsm = BtnState::IDLE;
   uint32_t press_time = 0;
-
   uint8_t led_blink_count = 0;
   uint32_t led_timer = 0;
 
@@ -170,18 +156,17 @@ int main(void) {
      */
     if (g_btn_event) {
       g_btn_event = false;
-      if (g_btn_state) { /* Pressed */
+      if (g_btn_state) { /* Кнопка нажата */
+        g_current_fsm_mode = 0; /* Опускаем график в 0 при контакте */
         if (btn_fsm == BtnState::IDLE) {
           btn_fsm = BtnState::PRESSED;
           press_time = HAL_GetTick();
         } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
           btn_fsm = BtnState::IDLE;
-
-          /* [DOUBLE CLICK] */
-          g_current_fsm_mode = 2;
+          g_current_fsm_mode = 2; /* [DOUBLE CLICK] */
           TIM2->ARR = 1599;
         }
-      } else { /* Released */
+      } else { /* Кнопка отпущена */
         if (btn_fsm == BtnState::PRESSED) {
           if (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS) {
             btn_fsm = BtnState::IDLE;
@@ -196,43 +181,30 @@ int main(void) {
     if (btn_fsm == BtnState::WAIT_DOUBLE &&
         (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
       btn_fsm = BtnState::IDLE;
-
-      /* [SHORT CLICK] */
-      g_current_fsm_mode = 1;
+      g_current_fsm_mode = 1; /* [SHORT CLICK] */
       TIM2->ARR = 3199;
     }
 
     if (btn_fsm == BtnState::PRESSED &&
         (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
       btn_fsm = BtnState::IDLE;
-
-      /* [LONG PRESS] */
-      g_current_fsm_mode = 3;
+      g_current_fsm_mode = 3; /* [LONG PRESS] */
       TIM2->ARR = 799;
     }
 
-    /* ==============================================================================
-     * ASYNCHRONOUS LED INDICATOR
-     * ==============================================================================
-     */
     if (led_blink_count > 0) {
       if (HAL_GetTick() - led_timer > LED_TOGGLE_INTERVAL_MS) {
         led_timer = HAL_GetTick();
-        if (led_blink_count % 2 == 0) {
+        if (led_blink_count % 2 == 0)
           LED_PC13_ON();
-        } else {
+        else
           LED_PC13_OFF();
-        }
         led_blink_count--;
       }
     } else {
       LED_PC13_OFF();
     }
 
-    /* ==============================================================================
-     * TELEMETRY TRANSMISSION (50 Hz / Every 20 ms)
-     * ==============================================================================
-     */
     if (__HAL_TIM_GET_FLAG(&htim4, TIM_FLAG_UPDATE)) {
       __HAL_TIM_CLEAR_IT(&htim4, TIM_IT_UPDATE);
 
@@ -241,7 +213,6 @@ int main(void) {
         uint32_t period = g_measured_period_ticks;
         uint32_t pulse = g_measured_pulse_ticks;
         uint32_t isr_duration = g_isr_duration_ticks;
-        /* Безопасно копируем текущее состояние */
         uint8_t current_btn_event = g_current_fsm_mode;
         __enable_irq();
 
@@ -251,7 +222,7 @@ int main(void) {
         metrics.duty_cycle_percent =
             static_cast<uint8_t>(duty > 100 ? 100 : duty);
         metrics.isr_time_ticks = static_cast<uint16_t>(isr_duration);
-        metrics.btn_event = current_btn_event; /* Упаковка флага в отправку */
+        metrics.btn_event = current_btn_event;
 
         bool sent = g_tx_manager.send_frame_with_ack(
             static_cast<uint8_t>(protocol::MessageType::DATA), g_msg_seq_num,
@@ -296,34 +267,30 @@ static void MX_GPIO_Init(void) {
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
 
-  /* LED PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /* PB1 Debug Pin */
   GPIO_InitStruct.Pin = GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* PB0 Button */
+  /* ИСПРАВЛЕНО: Кнопка на PA0 (WeAct Black Pill) */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 static void MX_DMA_Init(void) {
   __HAL_RCC_DMA1_CLK_ENABLE();
   __HAL_RCC_DMA2_CLK_ENABLE();
-
   HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
-
   HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
 }
@@ -331,7 +298,6 @@ static void MX_DMA_Init(void) {
 static void MX_TIM1_Init(void) {
   TIM_IC_InitTypeDef sConfigIC = {0};
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_TIM1_CLK_ENABLE();
 
   GPIO_InitStruct.Pin = GPIO_PIN_8;
@@ -378,7 +344,7 @@ static void MX_TIM2_Init(void) {
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 1599; /* 16 MHz / 1600 = 10 kHz PWM */
+  htim2.Init.Period = 1599;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   HAL_TIM_Base_Init(&htim2);
@@ -395,12 +361,13 @@ static void MX_TIM2_Init(void) {
   sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1);
 
-  sConfigOC.Pulse = 1190; /* Scaled to ~75% of 1600 */
+  /* ИСПРАВЛЕНО: Генерируем ШИМ только на Канале 2 (PA1) */
   HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2);
 
-  GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1;
+  /* ИСПРАВЛЕНО: Настраиваем как выход ШИМ только пин PA1 (оставляя PA0
+   * свободной кнопкой) */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
@@ -426,7 +393,6 @@ static void MX_TIM3_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_IC_InitTypeDef sConfigIC = {0};
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_TIM3_CLK_ENABLE();
 
   GPIO_InitStruct.Pin = GPIO_PIN_6;
@@ -469,9 +435,9 @@ static void MX_TIM4_Init(void) {
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   __HAL_RCC_TIM4_CLK_ENABLE();
   htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 1600 - 1; /* 16 MHz / 1600 = 10 kHz clock */
+  htim4.Init.Prescaler = 1600 - 1;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 200 - 1; /* 10 kHz / 200 = 50 Hz interrupt rate */
+  htim4.Init.Period = 200 - 1;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
     Error_Handler();
@@ -498,7 +464,6 @@ static void MX_TIM5_Init(void) {
 
 static void MX_USART1_UART_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-
   __HAL_RCC_USART1_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
@@ -534,30 +499,21 @@ static void MX_USART1_UART_Init(void) {
     Error_Handler();
 
   __HAL_LINKDMA(&huart1, hdmatx, hdma_usart1_tx);
-
   HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
-/*
- * INTERRUPT HANDLERS AND CALLBACKS
- */
 extern "C" {
-
 void DMA1_Stream5_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_tim2_ch1); }
 void DMA2_Stream7_IRQHandler(void) { HAL_DMA_IRQHandler(&hdma_usart1_tx); }
 
 void USART1_IRQHandler(void) {
-  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET) {
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE) != RESET)
     __HAL_UART_CLEAR_OREFLAG(&huart1);
-  }
-  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_NE) != RESET) {
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_NE) != RESET)
     __HAL_UART_CLEAR_NEFLAG(&huart1);
-  }
-  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_FE) != RESET) {
+  if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_FE) != RESET)
     __HAL_UART_CLEAR_FEFLAG(&huart1);
-  }
-
   HAL_UART_IRQHandler(&huart1);
 }
 
@@ -565,24 +521,22 @@ void TIM3_IRQHandler(void) { HAL_TIM_IRQHandler(&htim3); }
 void TIM1_CC_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }
 
 void TIM5_IRQHandler(void) {
-  DEBUG_PIN_HIGH(); /* Pulse high on PB1 (ISR measurement start) */
+  DEBUG_PIN_HIGH();
 
   if (__HAL_TIM_GET_FLAG(&htim5, TIM_FLAG_UPDATE)) {
     __HAL_TIM_CLEAR_IT(&htim5, TIM_IT_UPDATE);
 
-    /* Software sine wave stepping: 50 ms per step = 5.0 s total period */
     static uint32_t sine_timer = 0;
     static uint16_t sine_index = 0;
     if (++sine_timer >= 50) {
       sine_timer = 0;
-      TIM2->CCR1 = sine_lut[sine_index];
+      /* ИСПРАВЛЕНО: Обновляем только PA1 (Канал 2) */
+      TIM2->CCR2 = sine_lut[sine_index];
       sine_index = (sine_index + 1) % SINE_SAMPLES;
     }
 
-    /* Button debouncing logic */
     static uint16_t history = 0x0000;
     history = (history << 1) | (BTN_READ() ? 1 : 0);
-
     bool new_state = g_btn_state;
     if ((history & 0x03FF) == 0x03FF)
       new_state = true;
@@ -594,14 +548,12 @@ void TIM5_IRQHandler(void) {
       g_btn_event = true;
     }
   }
-
-  DEBUG_PIN_LOW(); /* Pulse low on PB1 (ISR measurement end) */
+  DEBUG_PIN_LOW();
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM3) {
-    g_tim3_overflows =
-        g_tim3_overflows + 1; /* Explicit assignment to avoid C++20 warning */
+    g_tim3_overflows = g_tim3_overflows + 1;
   }
 }
 
@@ -611,8 +563,6 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
   }
 }
 
-/* Input Capture Callback: Hardware measurement of PB1 strobe width on pin PA8
- */
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM3) {
     if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
@@ -630,12 +580,9 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     }
   }
 
-  /* High level duration measurement on PA8 (TIM1_CH1 -> CH2) */
   if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2) {
     uint32_t start = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
     uint32_t end = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-
-    /* Calculate and store ISR duration into global variable */
     g_isr_duration_ticks =
         (end >= start) ? (end - start) : ((0xFFFF - start) + end + 1);
   }
@@ -650,5 +597,4 @@ void Error_Handler(void) {
 #ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line) {}
 #endif
-
-} /* extern "C" */
+}
