@@ -71,10 +71,16 @@ volatile bool g_btn_event = false;
 volatile bool g_btn_state = false;
 enum class BtnState { IDLE, PRESSED, WAIT_DOUBLE };
 
+/* ДОБАВЛЕНО: Текущий режим для передачи на график (0=None, 1=Short, 2=Double,
+ * 3=Long) */
+volatile uint8_t g_current_fsm_mode = 0;
+
+/* ИЗМЕНЕНО: Структура теперь весит ровно 8 байт */
 struct __attribute__((packed)) PwmMetrics {
   uint32_t frequency_hz;
   uint8_t duty_cycle_percent;
   uint16_t isr_time_ticks;
+  uint8_t btn_event;
 };
 
 protocol::DiagnosticsStats g_stats{};
@@ -159,7 +165,7 @@ int main(void) {
     g_tx_manager.process_timeouts(HAL_GetTick());
 
     /* ==============================================================================
-     * BUTTON FINITE STATE MACHINE (FSM) WITH PWM FREQUENCY VISUALIZATION
+     * BUTTON FINITE STATE MACHINE (FSM)
      * ==============================================================================
      */
     if (g_btn_event) {
@@ -171,7 +177,8 @@ int main(void) {
         } else if (btn_fsm == BtnState::WAIT_DOUBLE) {
           btn_fsm = BtnState::IDLE;
 
-          /* [DOUBLE CLICK] -> Reset to 10 kHz */
+          /* [DOUBLE CLICK] */
+          g_current_fsm_mode = 2;
           TIM2->ARR = 1599;
         }
       } else { /* Released */
@@ -190,7 +197,8 @@ int main(void) {
         (HAL_GetTick() - press_time > SHORT_PRESS_TIMEOUT_MS)) {
       btn_fsm = BtnState::IDLE;
 
-      /* [SHORT CLICK] -> Drop frequency to ~5 kHz */
+      /* [SHORT CLICK] */
+      g_current_fsm_mode = 1;
       TIM2->ARR = 3199;
     }
 
@@ -198,13 +206,13 @@ int main(void) {
         (HAL_GetTick() - press_time > LONG_PRESS_THRESHOLD_MS)) {
       btn_fsm = BtnState::IDLE;
 
-      /* [LONG PRESS] -> Increase frequency to ~20 kHz */
+      /* [LONG PRESS] */
+      g_current_fsm_mode = 3;
       TIM2->ARR = 799;
     }
 
     /* ==============================================================================
-     * ASYNCHRONOUS LED INDICATOR (Left intact to prevent unused variable
-     * warnings)
+     * ASYNCHRONOUS LED INDICATOR
      * ==============================================================================
      */
     if (led_blink_count > 0) {
@@ -233,6 +241,8 @@ int main(void) {
         uint32_t period = g_measured_period_ticks;
         uint32_t pulse = g_measured_pulse_ticks;
         uint32_t isr_duration = g_isr_duration_ticks;
+        /* Безопасно копируем текущее состояние */
+        uint8_t current_btn_event = g_current_fsm_mode;
         __enable_irq();
 
         PwmMetrics metrics{};
@@ -241,6 +251,7 @@ int main(void) {
         metrics.duty_cycle_percent =
             static_cast<uint8_t>(duty > 100 ? 100 : duty);
         metrics.isr_time_ticks = static_cast<uint16_t>(isr_duration);
+        metrics.btn_event = current_btn_event; /* Упаковка флага в отправку */
 
         bool sent = g_tx_manager.send_frame_with_ack(
             static_cast<uint8_t>(protocol::MessageType::DATA), g_msg_seq_num,
